@@ -1,0 +1,55 @@
+{
+  // ===========================================================================
+  // READ THIS BEFORE ADDING A PATH OR "cmake.environment" TO THIS FILE
+  // ---------------------------------------------------------------------------
+  // "STM32Cube for VS Code" owns the CMake setup of this project. It writes the
+  // keys at the bottom of this file (cmake.cmakePath = "cube-cmake", ...) and it
+  // publishes the folder that contains cube-cmake.exe through the USER-level
+  // setting cmake.environment.PATH:
+  //     C:\Users\hasee\AppData\Roaming\Code\User\settings.json
+  // cube-cmake is a CMake 4.4 wrapper that injects the gnu-tools-for-stm32
+  // toolchain, ninja and the whole STM32Cube bundle PATH for every configure and
+  // build it launches - so no PATH entry is needed here.
+  //
+  // VS Code does NOT merge object settings across scopes: a workspace-level
+  // "cmake.environment" REPLACES the user-level one. With one present here,
+  // cube-cmake.exe is no longer on the PATH that CMake Tools spawns with and
+  // every configure dies with:
+  //     Error: spawn cube-cmake ENOENT
+  // CMake Tools deletes build/Debug *before* configuring, so that failed run
+  // leaves no build.ninja and no compile_commands.json: VS Code stops seeing the
+  // folder as a CMake project and the editor fills up with IntelliSense errors.
+  // That is exactly the failure that appeared after the CubeMX re-generation, and
+  // it is why no PATH is hard-coded here any more.
+  // ===========================================================================
+
+  // Configure through CMakePresets.json (configure preset "Debug" -> build/Debug)
+  // and do it automatically when the folder is opened.
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": true,
+
+  // IntelliSense from the compilation database produced by the configure step.
+  // (The STM32Cube extension also (re)generates .vscode/c_cpp_properties.json and
+  //  .clangd with the same path - these two lines are only a fallback.)
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/Debug/compile_commands.json",
+
+  // ---------------------------------------------------------------------------
+  // Everything below is written and maintained by the STM32Cube extension itself.
+  // Do not remove it: cmake.cmakePath is what makes the extension's toolchain
+  // wrapper (and therefore the STM32Cube bundles) available to CMake Tools.
+  // ---------------------------------------------------------------------------
+  "cmake.cmakePath": "cube-cmake",
+  "cmake.configureArgs": [
+    "-DCMAKE_COMMAND=cube-cmake"
+  ],
+  "cmake.preferredGenerators": [
+    "Ninja"
+  ],
+  "stm32cube-ide-clangd.path": "cube",
+  "stm32cube-ide-clangd.arguments": [
+    "starm-clangd",
+    "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gcc*",
+    "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-g++*"
+  ]
+}
