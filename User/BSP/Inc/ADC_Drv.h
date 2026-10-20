@@ -120,6 +120,12 @@ uint8_t ADC_Drv_CaptureIsDone(void);
 uint32_t ADC_Drv_CaptureRemaining(void);
 
 /**
+  * @brief  最近一次停止采集瞬间 DMA 还剩多少个点没搬（0 = 已经搬满）
+  * @note   诊断用：超时时看这个值就能区分"DMA 提前停了"和"搬满了但没收到完成中断"
+  */
+uint32_t ADC_Drv_GetLastRemaining(void);
+
+/**
   * @brief  停止并释放采集资源（停定时器、停 DMA、清状态）
   * @note   任何时刻调用都安全，可重复调用；一般在
   *         ADC_Drv_CaptureIsDone() 返回 1 之后调用。

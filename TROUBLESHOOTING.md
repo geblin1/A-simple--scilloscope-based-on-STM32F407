@@ -19,10 +19,22 @@
 | 6 | TIM2 触发永远不来 | CubeMX 给 32 位定时器填了 `Period=4294967295` |
 | 7 | 硬件触发后软件启动失效 | `EXTEN≠0` 时硬件忽略 `SWSTART` |
 | 8 | ADC 两路读数恒为 0 | ADC2 的 ADON 从未置位 |
-| 9 | ADC2 只在复位时测一次 | 双 ADC 同步模式下读 `CDR` 高 16 位不可靠 |
+| 9 | CH2 数值永远不变（零噪声死数） | 从器件 ADC2 的 `EXTEN=00`，没有触发边沿，只转换了第一次 |
 | 10 | DMA 只搬了 1 个点 | 多 ADC 模式的 `HAL` 不置 `CR2.DMA`；`CCR.DDS` 被覆盖 |
 | 11 | 按键只亮灭、不闪烁 | 代码里根本没有闪烁逻辑，且按键只在松手沿上报一次 |
 | 12 | 串口助手收不到数据 | 板载 CH340 未接到 MCU，需外部跳线 |
+| 13 | 编码器转一格数值跳 4 | TIM8/TIM4 是 x4 计数，没折算成"格" |
+| 14 | 双通道波形完全重合、`RUN`/`HOLD` 像反了 | 调度器没启动时 `taskENTER_CRITICAL()` 把中断永久关死 |
+| 15 | 修好 CH2 后自检报 `READ FAIL` | 把 ADC1 的 `EXTEN` 复制给了 ADC2，`ReadOnce` 只清了主器件的 |
+| 16 | 波形在动、`RMS`/`DC` 不动 | 测量被关在"采集成功"分支里，而帧尾 `OVR` 让每帧都判失败 |
+| 17 | 状态栏显示成 `Dx1` | `%cx%u` 把一个字符串指针当成 `char` 打印 |
+| 18 | 编码器1 只改一个通道的 V/div | 只更新了"当前测量通道"的档位 |
+| 19 | 退出菜单后弹窗又出现 | 退出路径仍无条件调用 `App_DrawMenu()` |
+| 20 | 进菜单不显示、转一下编码器才出现 | 进入那一帧只重画了波形和条带，没画弹窗 |
+| 21 | 面板实际颜色与配置相反（蓝/红 vs 黄/青） | ST7789 的 RGB/BGR 顺序（`MADCTL`）与配置不同 |
+| 22 | 帧率只有约 8 fps | 每帧整片重画 166 KB，而 SPI 只有 1.31 MB/s |
+| 23 | 零点/增益算错，实测与纸面对不上 | 把 `R_th`(500 Ω) 当成 `R_down`(1000 Ω)，`Rs` 其实与它**并联** |
+| 24 | CH2 没搭建时读数 3.27 V，像短路 | 高阻悬空被防过压肖特基的反向漏电流拉高 |
 
 ---
 
@@ -390,34 +402,52 @@ HAL_Delay(1U);     /* 等 tSTAB（手册约 3us，给 1ms 足够） */
 ### 问题 9：ADC2 只在复位时测一次，之后一直是同一个值
 
 **现象**
-使能 ADC2 后，第一帧的数是对的，之后就冻结在复位那一刻的值不再变化。
+双 ADC 同步采集时，CH1 的读数每帧都在动，CH2 却是一个**零噪声的死数**
+（实测恒为 `4071`）：把探头从 VCC 拔下来插到 GND，参数栏各项数值毫无变化。
+自检、DMA 测试、正式 App 三条路径表现完全一致。
 
-**根因**
-双 ADC 规则同步模式下，靠读公共数据寄存器 `ADC->CDR` 的高 16 位来取从器件结果，
-在**没有开 DMA 的情况下并不可靠**——第一次转换后就冻结了。
+**错误的第一版结论（留作教训）**
+一开始判断成"双 ADC 同步模式下读 `ADC->CDR` 高 16 位不可靠"，于是把自检临时改成
+独立模式（退出多 ADC、分别启动分别读 `DR`）绕了过去——**这只是把问题藏起来了**，
+正式采集路径一直是坏的。
 
-**解决**
-自检场景不需要同步，改用**独立模式**逐路轮询：临时退出多 ADC 模式，分别启动、
-分别读各自的 `DR`，最后恢复：
+**真正的根因**
+从器件 ADC2 的 `CR2.EXTEN` 仍然是 `00`（软件启动），**它没有自己的触发边沿**。
+双 ADC 规则同步模式下 ADC2 只在被使能的那一次转换出一个结果，之后再无触发，
+`ADC->CDR` 的高 16 位就一直停在那个旧值上。
 
+**定位方法**（把寄存器直接打到屏上，一行就够）
+```
+A2c16000401 A2s00000032 A1s00000000 C00018006
+```
+| 字段 | 判读 |
+|---|---|
+| `A2c`（ADC2->CR2）bit0 | `1` = ADON 已使能（正常） |
+| `A2c` bit[27:24] | `6` = EXTSEL 选的 TIM2_TRGO |
+| `A2c` bit[29:28] | `1` = 上升沿。**修之前这里是 `00`，即 `EXTEN=00`** |
+| `C`（ADC->CCR） | MULTI=6 / DMA=2 / ADCPRE=1，说明公共配置本来就没错 |
+| `A2s`（ADC2->SR）= `0x32` | 停采集**之后**的残影：最后一个点没有 DMA 接收，OVR 置位属正常 |
+
+**解决**（`User/BSP/Src/ADC_Drv.c`）
 ```c
-saved_ccr = ADC->CCR;
-ADC->CCR  = saved_ccr & ~(ADC_CCR_MULTI | ADC_CCR_DMA);   /* 退出同步模式 */
-saved_exten = hadc1.Instance->CR2 & ADC_CR2_EXTEN;
-saved_dma   = hadc1.Instance->CR2 & ADC_CR2_DMA;
-hadc1.Instance->CR2 &= ~(ADC_CR2_EXTEN | ADC_CR2_DMA);    /* 回到软件启动，见问题 7 */
+/* ADC_Drv_Init()：从器件与主器件同源触发，并清掉开机残留的 OVR */
+hadc2.Instance->SR = 0U;
+{
+    uint32_t trig = hadc1.Instance->CR2 & (ADC_CR2_EXTSEL | ADC_CR2_EXTEN);
+    hadc2.Instance->CR2 = (hadc2.Instance->CR2 & ~(ADC_CR2_EXTSEL | ADC_CR2_EXTEN)) | trig;
+}
 
-/* hadc1: Start + PollForConversion + 读 DR */
-/* hadc2: Start + PollForConversion + 读 DR */
-
-hadc1.Instance->CR2 |= (saved_exten | saved_dma);
-ADC->CCR = saved_ccr;                                      /* 原样恢复 */
+/* ADC_Drv_CaptureStart()：每帧开头也清一次 —— OVR 置位会让 ADC 停止转换 */
+hadc2.Instance->SR = 0U;
 ```
 
 **经验**
-`ADC->CDR`（`ADC123_COMMON` 基址 `0x40012300`，偏移 `0x08`）低 16 位是 ADC1、
-高 16 位是 ADC2，**一次读取拿到两路、没有先后时差**——但它只在同步模式且转换真正发生时更新。
-要用它就必须把 DMA/触发路径配全，否则退回独立模式更省心。
+1. 双 ADC 同步模式下 `HAL_ADCEx_MultiModeStart_DMA()` / `HAL_ADCEx_MultiModeConfigChannel()`
+   **都不会给从器件配触发**，CubeMX 也不生成，必须自己把 `EXTSEL/EXTEN` 复制过去。
+2. F4 的 ADC 一旦 `OVR` 置位就**停止转换**，所以"只测一次、之后永远不变"优先查 `OVR`。
+3. **看到零噪声的固定值，先怀疑数据没更新，而不是信号稳定**——真实模拟量至少有 ±1 LSB 抖动。
+4. `ADC->CDR`（`ADC123_COMMON` 基址 `0x40012300`，偏移 `0x08`）低 16 位是 ADC1、高 16 位是 ADC2，
+   一次读取拿到两路、没有先后时差；但它只在同步模式且转换真正发生时更新。
 
 ---
 
@@ -559,7 +589,588 @@ GND 共地
 
 ---
 
-## 六、关键 HAL 源码事实（这次调试的真正收获）
+## 六、LCD 驱动的实现方法（10 月 20 日）
+
+这一节不写"踩了哪个坑"，而是把驱动从零做起来的**设计思路**记下来，
+方便以后换屏、加页面时复用同一套结构。
+
+### 6.1 硬件与总线
+
+| 项目 | 值 |
+|---|---|
+| 屏 | ST7789，2.4 寸 IPS，原生 240×320，**无 MISO**（只写不读） |
+| 总线 | SPI1，单向 2Lines，8 bit，MSB first |
+| 模式 | `CPOL=HIGH` + `CPHA=2EDGE` → **SPI 模式 3** |
+| 速率 | `SPI_BAUDRATEPRESCALER_8` → 84 MHz / 8 = **10.5 Mbit/s ≈ 1.31 MB/s** |
+| 引脚 | SCK=PA5、MOSI=PA7（AF5）；CS=PA4、DC=PB0、RES=PB1、BLK=PB2（推挽输出，初值高） |
+
+**关键结论：SPI 才是瓶颈。** 全屏 320×240×2 = 153 600 B，按 1.31 MB/s 算
+≈ **117 ms/帧**，物理上限只有 8.5 fps。所以后面所有显示优化，本质都是"少发字节"。
+
+### 6.2 初始化序列
+
+顺序是有讲究的，冷启动（硬复位）和软复位都要覆盖：
+
+```
+硬复位 RES 拉低 10 ms → 拉高 → 等 120 ms
+SWRESET(0x01) + 120 ms          ← 软复位也要等
+SLPOUT(0x11)  + 120 ms          ← 退出睡眠
+COLMOD(0x3A) = 0x55             ← RGB565，16 bit/像素
+MADCTL(0x36) = 0x60             ← 横屏 320×240（方向不对只改这一个宏）
+PORCTRL/GCTRL/VCOMS/LCMCTRL/VDVVRHEN/VRHS/VDVS/FRCTRL2/PWCTRL1
+PVGAMCTRL(0xE0) 14 字节 / NVGAMCTRL(0xE1) 14 字节
+INVON(0x21)                     ← IPS 面板通常需要反显
+NORON(0x13)
+Lcd_Fill(BLACK)                 ← 先清屏，避免上电花屏
+DISPON(0x29) + 100 ms
+开背光 BLK = 1
+```
+
+**经验**：`MADCTL` 一个字节决定旋转方向，`0x60` 是横屏；方向不对时优先改它，
+不要去改所有绘制函数的坐标。若颜色反了（红蓝互换），把 `0x60` 改成 `0x68`（BGR 位）。
+
+### 6.3 写屏的两条铁律
+
+**① 一次窗口、批量写 —— 绝不每点设窗口**
+
+```
+Lcd_SetWindow(x, y, w, h);      ← 只写一次 CASET/RASET
+Lcd_PushColors(buf, count);     ← 连续推 count 个像素
+```
+
+每设一次窗口都要发 `CASET`+`RASET`+`RAMWR` 三条命令（约 10 字节命令开销），
+逐像素设窗口的话，1200 个像素的命令开销就超过数据本身。
+
+**② RGB565 必须转大端**
+
+STM32 是小端，屏要的是高字节先出。驱动里用一块 `static uint8_t s_tx[128*2]`
+做 128 像素一批的字节交换，避免为整行再开一块 640 B 的临时缓冲。
+
+### 6.4 字模：为什么最后是手写点阵
+
+依次试过三种方案，全部失败：
+
+| 方案 | 结果 |
+|---|---|
+| `consola.ttf` 11/12 px + 阈值 96/160/192/224 | 糊成一团，`0`/`8` 变实心块；阈值调高又断笔 |
+| Pillow `load_default()` | 是 FreeType 矢量（Aileron 10px），阈值 128 时 `5` 的左竖丢失 |
+| Pillow `load_default_imagefont()` | 确是点阵，但笔画 2px，6×10 格子里 `A` 渲染残缺 |
+
+**根因**：TrueType 在 6×10 这种尺寸下抗锯齿会串色，任何阈值都无法同时救"粗"和"断"。
+
+**最终方案**：手写 5×7 点阵，字形用 `#`/`.` 字符串写在 `tools/gen_font.py` 的
+`GLYPHS` 字典里，脚本生成 `User/BSP/Src/Font.c`（`95 × 7 = 665 B`）。
+- 单元 6×9（右 1 px、下 2 px 间隔），小写字母映射成大写
+- 大字号不另存表，用 `Font_Expand2()` 把每行掩码 2 倍展开 → 12×18，表大小仍为 0
+- `python tools/gen_font.py --preview` 可以直接在终端预览字形，改字模不用烧板子
+
+### 6.5 分层：谁允许碰 HAL
+
+```
+App      App_Scope.c  ScopeMenu.c        ← 按键、状态机、编排
+View     View.c  WaveView.c  StatusBar.c  ParamBar.c   ← 布局、配色、增量逻辑
+BSP      Lcd.c  Font.c  Frontend.c  ADC_Drv.c ...      ← 唯一接触 HAL 的一层
+```
+
+`View` 里**不允许** `#include "spi.h"` / `"adc.h"`，它只知道"给我一组 mV 和 V/div，
+我把它们画成像素"。换屏时只改 `Lcd.c`；换采样器件时只改 `ADC_Drv.c`。
+
+### 6.6 布局与坐标映射
+
+```
+(0,0)                                               (319,0)
+┌───────────────────────────────────────────────┐
+│ 状态栏 22 px                                  │
+├───────────────────────────────────────────────┤
+│ 波形区 190 px：8 列 × 10 行，每格 40 × 19 px   │  ← 中轴线 y = 117
+├───────────────────────────────────────────────┤
+│ 参数栏 28 px                                  │
+└───────────────────────────────────────────────┘
+```
+
+垂直映射（**标定已在 App 层由 `Frontend` 完成，View 只做线性映射**）：
+
+```c
+y = VIEW_WAVE_MID_Y - (mv * VIEW_PX_PER_VDIV) / vdiv_mv;   /* 117 - mv*19/vdiv */
+y = clamp(y, VIEW_WAVE_Y, VIEW_WAVE_Y + VIEW_WAVE_H - 1);  /* 22 ~ 211 */
+```
+
+0 V 固定画在中轴线上，负电压自然落在下方——这也决定了改造后的前端
+（带 1.65 V 偏置）必须先把偏置扣掉，否则 0 V 会跑到中心以上。
+
+### 6.7 增量刷新（把 8 fps 拉到 30+ fps 的核心）
+
+**先算账**（旧实现，每帧）：
+
+| 项目 | 字节 |
+|---|---|
+| 波形区整片填充 320×190 | 121 600 |
+| 网格线 | ≈ 10 000 |
+| 曲线 | ≈ 2 000 |
+| 状态栏整条 | 14 080 |
+| 参数栏整条 | 17 920 |
+| **合计** | **≈ 166 KB → 127 ms → 8 fps** |
+
+**优化思路：把"每帧重画"改成"只重画变了的行"**，共四层：
+
+1. **脏行位图**：190 行用一个 24 B 的位图标记"这行要发"。
+2. **行模板**：背景色是规律的（边框/网格线/普通行只有 3 种），预先算好
+   `s_row_normal[320]`（640 B），普通行直接 `memcpy` 出来，不用逐像素判断。
+3. **行指纹（关键）**：每行合成完算一个 32 位 FNV-1a，与上一帧同行的哈希比较，
+   **相同就整行不发 SPI**。波形静止或噪声很小时，绝大多数行都被跳过。
+4. **上下条带各自增量**：
+   - 状态栏：把整个 `StatusBar_Info` 与上一帧 `memcmp`，没变化直接跳过（省 14 KB/帧）
+   - 参数栏：五个字段各自 `strncmp`，只重画变了的字段，并用背景色清掉旧值尾巴
+
+**结果显示区域典型帧只发 30~50 KB → 23~38 ms → 26~43 fps**，
+额外 RAM 只花了约 4.75 KB（行模板 640 B + 行缓冲 640 B + 前后 y 数组 + 指纹 760 B + 位图 24 B），
+没有采用"121.6 KB 影子缓冲"的方案。
+
+**增量刷新的三个坑（都踩过）**：
+
+- **通道隐藏时要擦旧轨迹**：CH2 关掉后不能只"不画新的"，还要把上一帧的位置用背景刷掉，
+  否则会留一条残影。做法是隐藏时对 `s_prev_y` 走一遍 `Wave_MarkPrev()`。
+- **弹窗会盖住波形区**：菜单退出后必须整片重画（`WaveView_Invalidate()` 把 `s_valid` 清 0，
+  下一帧 `Wave_DirtyAll()` 重建全部 190 行），否则弹窗底下那一块永远是旧的。
+- **提示文字会被自动擦掉**：上电的 `PRESS KEY4 TO RUN` 是画在波形区里的，
+  `WaveView_DrawMessage()` 结束时把 `s_valid` 清 0，第一次真正画波形时整片重建就会覆盖它，
+  不需要额外的擦除逻辑。
+
+### 6.8 颜色：配置值不等于显示色
+
+`CH1 = 0xFFE0`（RGB565 里是**黄**）实测显示**蓝**，`CH2 = 0x07FF`（**青**）实测显示**红**。
+这是面板的 RGB/BGR 顺序与配置不一致（`MADCTL` 的 BGR 位），不是代码 bug。
+处理办法：**颜色宏不改**，只把注释和文档改成"配置为黄，实际偏蓝"，认线按实际显示来；
+若确实想纠正，把 `LCD_MADCTL` 从 `0x60` 改成 `0x68`。
+
+---
+
+## 七、10 月 20 日新增问题
+
+### 问题 13：编码器转一格，数值一下跳 4
+
+**现象**
+`Encoder_Get()` 每转一格（一个定位点）返回值变化 4，调 V/div 时一档一档蹦。
+
+**根因**
+TIM8/TIM4 配的是 `Encoder Mode TI1 and TI2`，即 **x4 计数**：
+A/B 两相的上升沿、下降沿都计数，所以一个机械定位点 = 4 个计数。
+
+**解决**
+不改 CubeMX 配置，在驱动层折算（`User/BSP/Src/EncoderDrv.c`）：
+
+```c
+#define ENCODER_DRV_COUNTS_PER_DETENT  4
+
+/* 必须做余数累加，不能直接 raw_delta / 4 */
+static int16_t EncoderDrv_ToDetents(int16_t raw_delta, int32_t *rem)
+{
+    int32_t total = *rem + (int32_t)raw_delta;
+    int16_t detents = (int16_t)(total / ENCODER_DRV_COUNTS_PER_DETENT);
+
+    *rem = total - (int32_t)detents * ENCODER_DRV_COUNTS_PER_DETENT;
+    return detents;
+}
+```
+
+**为什么不能直接除**
+主循环一帧可能超过 100 ms，期间编码器可能只转了"1 个计数"。
+直接 `1/4 = 0`，四次就被整除丢掉——**慢速旋转会丢步**。
+余数累加把"没凑够一格"的零头留到下一次，一格都不丢。
+
+**经验**
+编码器"一转就跳 4"是 x4 计数的正常行为，不要改硬件滤波或降计数模式，
+**在软件里折算成"格"更稳**；而折算必须带余数。
+
+---
+
+### 问题 14：双通道波形完全重合，而且 `RUN`/`HOLD` 像是反的
+
+**现象**
+CH1 接 GND、CH2 接 VCC，屏幕上两条线却完全重叠；按 KEY4 切 RUN/HOLD 时，
+画面看不出任何变化，像是显示反了。
+
+**定位过程**
+先排除显示层：`y = 117 - (v_mv - 0)*19/500`，0 V → y≈179、3.3 V → y≈55，
+**数据正确时两条线数学上不可能重合** → 说明两路数据相同，或者数据根本没更新。
+
+加诊断行打印两路码值与采集状态码后，读到：
+
+```
+1:0-0  2:0-0  w0FD7000x  st3
+```
+
+`st3` = `TIMEOUT`，而 `w0` 每帧都在变（说明 DMA 确实搬进了至少一个字）。
+于是把怀疑转向"完成标志没置位"。
+
+**根因（决定性，A/B 两层）**
+
+**A. `taskENTER_CRITICAL()` 在调度器没启动时把中断永久关死**
+
+`ADC_Drv_CaptureStart()` 原来用任务级临界区保护启动时序：
+
+```c
+taskENTER_CRITICAL();   /* 改 s_busy / s_done / s_error */
+...
+taskEXIT_CRITICAL();
+```
+
+但本工程 `Core/Src/main.c` 里是 `// freertos_app_start();`（**调度器没启动**），而：
+
+| 事实 | 位置 |
+|---|---|
+| `uxCriticalNesting` 的**初值是 `0xaaaaaaaa`**（不是 0） | `ThirdParty/FreeRTOS/Source/portable/GCC/ARM_CM4F/port.c:161` |
+| 只有 `xPortStartScheduler()` 会把它清 0 | 同文件 `:443` |
+| `vPortExitCritical()` 只在计数归 0 时才 `portENABLE_INTERRUPTS()` | 同文件 `:493-502` |
+
+于是 `enter` → `0xAAAAAAAB`，`exit` → `0xAAAAAAAA` ≠ 0 → **`PRIMASK` 永远是 1**，
+之后所有中断都不再响应：TIM7 时基（按键扫描就在里面）、DMA2_Stream0 完成中断全部停摆。
+
+**B. 由此产生的连锁**
+
+`s_done` 只能由 DMA 完成中断置位 → 采集永远超时 → `App_Capture()` 返回失败 →
+`s_ch1[]/s_ch2[]` 保持上电时的全 0 → 两条线都画在同一条 y 上**完全重合**；
+而画面因为数据不变、增量刷新判定"无变化"，一帧都不发 → 看起来像 HOLD。
+`StatusBar.c` 里 `(running != 0U) ? "RUN" : "HOLD"` 本身是对的，只是画面不动了。
+
+**解决**
+临界区按调度器状态分支（`User/BSP/Src/ADC_Drv.c`）：
+
+```c
+if (adc_drv_sched_running() == pdTRUE)
+{
+    taskENTER_CRITICAL();
+    ... 改 s_busy / s_done / s_error ...
+    taskEXIT_CRITICAL();
+}
+else
+{
+    uint32_t primask = __get_PRIMASK();   /* 裸机：自己保存/恢复 PRIMASK */
+    __disable_irq();
+    ... 改 s_busy / s_done / s_error ...
+    __set_PRIMASK(primask);
+}
+```
+
+**验证**
+修复后诊断行变为 `1:0-x 2:4039-4039 N0 w0FC7000y ST0`（`N0` = NDTR 归零，320 点全搬满），
+两路线终于分离。
+
+**经验**
+**"用了 FreeRTOS 的 API" ≠ "FreeRTOS 在运行"。**
+只要调用了 `taskENTER_CRITICAL()` / `vTaskDelay()` 这类 API，就必须先确认
+`xTaskGetSchedulerState()`，否则在裸机下会出现"静默关中断""永久阻塞"这类
+极难排查的故障。**这类 bug 的表象总是"数据不动"，而不是"报错"。**
+
+---
+
+### 问题 15：修好 CH2 之后，自检程序报 `READ FAIL`
+
+**现象**
+为了让 ADC2 也能被 TIM2 触发，在 `ADC_Drv_Init()` 里把 ADC1 的
+`(ADC_CR2_EXTSEL | ADC_CR2_EXTEN)` 复制给了 ADC2。CH2 恢复正常，
+但轮询式自检 `ADC_Drv_ReadOnce()` 开始超时。
+
+**根因**
+`HAL_ADC_Start()` 内部只在 `CR2.EXTEN == 0`（软件触发）时才置 `SWSTART`
+（`stm32f4xx_hal_adc.c:797`）。`ReadOnce()` 只清了 `hadc1` 的 `EXTEN`，
+**ADC2 的 `EXTEN` 还留着**，于是 `HAL_ADC_Start(&hadc2)` 永远不启动 → 轮询 20 ms 超时。
+
+**解决**
+`ADC_Drv_ReadOnce()` 对两个 ADC 都做保存/清除/恢复：
+
+```c
+saved_exten1 = hadc1.Instance->CR2 & ADC_CR2_EXTEN;
+saved_exten2 = hadc2.Instance->CR2 & ADC_CR2_EXTEN;
+hadc1.Instance->CR2 &= ~(ADC_CR2_EXTEN | ADC_CR2_DMA);
+hadc2.Instance->CR2 &= ~(ADC_CR2_EXTEN | ADC_CR2_DMA);
+... 采样 ...
+hadc1.Instance->CR2 |= (saved_exten1 | saved_dma1);
+hadc2.Instance->CR2 |= (saved_exten2 | saved_dma2);
+```
+
+**经验**
+**"为了修 A 而改的全局配置，会打破 B 的隐含前提。"**
+多路径共用同一个外设时，每条路径都必须自己把状态恢复干净，
+并且在改动后把**所有**调用路径都回归一遍（这里就是自检路径和采集路径）。
+`CR2.DMA` 也要一起清——`HAL_ADC_PollForConversion()` 在 `EOCS && DMA`
+同时置位时会立刻返回 `HAL_ERROR`。
+
+---
+
+### 问题 16：波形在动，`RMS` 和 `DC` 却一直不动
+
+**现象**
+CH1 波形随探头变化，但参数栏的 `RMS`、`DC` 始终是上电时的值。
+
+**根因（两层）**
+1. 主循环把测量关在"采集成功"分支里：
+
+   ```c
+   if (App_Capture() != 0U) { Measure_Analyze(src, ...); }
+   ```
+
+   而波形是无条件用 `s_ch1` 画的（`App_Capture()` 无论成败都拆缓冲）。
+2. `App_Capture()` 几乎每帧都返回失败：帧尾最后一两个转换没有 DMA 接收，
+   会置 `OVR` → `HAL_ADC_ErrorCallback()` 置 `s_error=1` →
+   `ADC_Drv_CaptureWait()` 结尾把**整帧**判成 `ERROR`，尽管 320 点早已搬完。
+
+**解决**
+
+驱动侧改成"数据完整性优先"（`ADC_Drv_CaptureWait()` 结尾）：
+
+```c
+ADC_Drv_CaptureStop();
+
+/* 整帧搬满（NDTR 归零）就算成功，帧尾的 OVR 只是残影 */
+if ((s_done != 0U) && (s_last_ndtr == 0U))
+{
+    ret = ADC_DRV_OK;
+}
+else if ((ret == ADC_DRV_OK) && (s_error != 0U))
+{
+    ret = ADC_DRV_ERROR;
+}
+```
+
+App 侧让测量跟着缓冲走：
+
+```c
+(void)App_Capture();                       /* 成功与否都往下走 */
+Measure_Analyze(src, APP_CAP_LEN, s_st.sps, &s_meas);
+```
+
+**经验**
+**"波形活、数字死"几乎一定是两条路径读了不同的数据源。**
+让"显示"和"测量"共用同一份缓冲、同一个判定，就不会再出现这种撕裂。
+
+---
+
+### 问题 17：状态栏本该显示 `DCx1`，实际显示 `Dx1`
+
+**根因**
+格式化时把字符串指针当成了字符：
+
+```c
+snprintf(buf, sizeof(buf), "%cx%u", 'D' | 'A', atten);   /* 错 */
+```
+
+`%c` 只取一个 `char`，`"DC"` 这个指针被截断成首字符 `'D'`。
+
+**解决**
+```c
+snprintf(buf, sizeof(buf), "%s %c", (ac_dc != 0U) ? "AC" : "DC",
+         (range != 0U) ? 'S' : 'W');      /* DC S / DC W */
+```
+
+**经验**
+`%c` 吃的是**整数**，传字符串字面量在某些编译器上只是 warning（指针截断），
+运行期不会崩，只会打出莫名其妙的字符。见到"少字母"的显示问题先查格式符。
+
+---
+
+### 问题 18：编码器1 只改一个通道的 V/div
+
+**现象**
+转编码器1 时只有一条线缩放（实际显示为蓝色的那条），另一条不动。
+
+**根因**
+`App_HandleMain()` 里 `ch = measure_ch - 1;` 只改**当前测量通道**的
+`vdiv_idx[ch]`。这不是逻辑错误，而是"分通道 V/div"的设计取舍——
+只是用户期望的是"同屏两路用同一套分辨率"。
+
+**解决**
+`App_State.vdiv_idx` 从 `uint8_t[2]` 改成**单个 `uint8_t`**，双通道共用；
+主界面编码器1、菜单、状态栏、波形映射全部取同一个值。
+分通道微调的能力放到以后再考虑。
+
+**经验**
+**"共用档位"比"每通道一份"更容易解释也更容易对齐**：
+同屏两条线用同一套电压-像素换算，才不会出现"看起来一样的幅度其实读数不同"。
+
+---
+
+### 问题 19：按 KEY2 退出菜单，弹窗又冒出来
+
+**现象**
+按 KEY2 后 `SETTINGS` 弹窗内容消失了一瞬间，随后又画了回来，
+看起来"只是把窗口擦了，其实还留在菜单里"。
+
+**根因**
+`App_Scope_Loop()` 的退出路径把 `s_st.menu` 置 0 之后，**仍然无条件调用 `App_DrawMenu()`**：
+
+```c
+redraw = App_HandleMenu(d1, d2, key);
+if (redraw) { App_DrawWave(); App_DrawBars(); App_DrawMenu(); }   /* ← 错 */
+return;
+```
+
+置 0 只改了状态，屏幕上的弹窗还在；重画一次就"复活"了。
+
+**解决**
+弹窗绘制只在"确实还在菜单里"时执行，退出时贯穿到主界面重画流程：
+
+```c
+if (s_st.menu != 0U)
+{
+    if (redraw) { App_DrawWave(); App_DrawBars(); App_DrawMenu(); }
+    return;
+}
+redraw = 1U;    /* 刚退出：本帧按主界面完整重画，且不画弹窗 */
+```
+
+**经验**
+**状态机里"改状态"和"改画面"必须成对**。
+凡是 `if (state)` 里画某物的，退出那次转换就不能再走那条分支。
+
+---
+
+### 问题 20：按 KEY2 进菜单不显示，转一下编码器才出来
+
+**现象**
+修完问题 19 后出现新问题：按 KEY2 没有任何反应，转动编码器后菜单才出现。
+
+**根因**
+这个问题 19 的修法带来的**副作用**：进入菜单的那一帧走的是主流程收尾
+`if (redraw) { App_DrawWave(); App_DrawBars(); }`，里面**没有** `App_DrawMenu()`。
+下一帧进菜单分支时若没有任何输入，`App_HandleMenu()` 返回 `redraw == 0` 直接 `return`，
+弹窗就一直不出现——直到转编码器产生 `redraw == 1` 才第一次画。
+
+**解决**
+在收尾重画里补一行，前提仍然是 `s_st.menu != 0U`：
+
+```c
+if (redraw != 0U)
+{
+    App_DrawWave();
+    App_DrawBars();
+
+    if (s_st.menu != 0U) { App_DrawMenu(); }   /* 进入菜单那一帧 */
+}
+```
+
+**验证**（四条状态转换逐一核对）
+进入菜单 → 当帧出弹窗；菜单中无输入 → 不重画；菜单中转编码器 → 重画数值；
+菜单中按 KEY2 → 当帧退出并完整重画主界面。
+
+**经验**
+修一个状态机 bug 时，**要把"进入 / 停留 / 操作 / 退出"四种转换全部列出来过一遍**。
+只盯着出错的那一条，很容易把问题挤到相邻的分支上。
+
+---
+
+### 问题 21：面板显示的颜色和配置值相反
+
+**现象**
+代码里 CH1 配 `0xFFE0`（黄）、CH2 配 `0x07FF`（青），实际显示是**蓝**和**红**。
+
+**根因**
+面板的 RGB/BGR 数据顺序与 `MADCTL` 配置不一致（`0x60` 与 `0x68` 的差别就是 BGR 位）。
+
+**解决**
+不改颜色宏，只把注释和文档改成实机表现（`ScopeView.h`、`LCD_UI_DESIGN.md`、`CONTROLS.md`）；
+真要纠正就把 `LCD_MADCTL` 改成 `0x68`。
+
+**经验**
+**RGB565 的数值不能字面理解"红色 = 0xF800 就一定红"**，
+最终颜色由面板的子像素顺序决定。显示类问题先分清"配置错"和"面板反了"。
+
+---
+
+### 问题 22：帧率只有约 8 fps
+
+详见 **6.7 增量刷新**。一句话：每帧整片重画约 166 KB，SPI 只有 1.31 MB/s，
+127 ms/帧就是物理上限。
+
+**解决**：脏行位图 + 行模板 + **行指纹（32 位 FNV-1a）** 跳过未变化的行 + 上下条带各自增量。
+典型帧从 166 KB 降到 30~50 KB，帧率提升到 26~43 fps。
+
+**经验**
+**先算带宽，再写代码。** 知道"1.31 MB/s"和"每帧 166 KB"之后，
+优化方向（少发字节）是自然算出来的，而不是靠猜。
+
+---
+
+### 问题 23：前端零点/增益算错，直到被实测数据揭穿
+
+**现象**
+按纸面推导写的参数表（零点 157 mV / 1171 mV、增益 1/10.5 与 1/1.41、
+"负向恒为 −1.65 V"）与实际读数对不上：实测大量程 1941、小量程 1320（输入接 GND）。
+
+**根因**
+把偏置的**戴维南电阻 `R_th`（500 Ω = 1 kΩ ∥ 1 kΩ）**当成了下拉电阻 `R_down`（1000 Ω）。
+实际上 `Rs`（10 kΩ 或 909 Ω）与下拉电阻是**并联**关系，不是串联。
+
+正确的节点方程（基尔霍夫）：
+
+```
+(V − 3.3)/1k + V/1k + (V − Vin)/Rs = 0
+→ V = V_th + (Vin − V_th)·g,   V_th = 1.65 V,  R_th = 500 Ω,  g = R_th/(R_th + Rs)
+```
+
+推论：
+
+| 量 | 表达式 |
+|---|---|
+| 零点引脚电压 | `V_th·(1 − g)` |
+| 可测下限 | `−V_th·(1/g − 1)` |
+| 可测上限 | `+V_th·(1/g + 1)` |
+| 窗口宽度 | `3.3 V / g`（**中心恒在 +1.65 V**） |
+
+修正后的数值：大量程 `g = 1/21`、零点 1.571 V（raw 1950）、−33.0…+36.3 V；
+小量程 `g = 1/2.818`、零点 1.065 V（raw 1321）、−3.00…+6.30 V。
+用实测反算：1941 vs 1950（−0.5 %）、1320 vs 1321（−0.1 %）→ **硬件是对的，参数表是错的**。
+
+**解决**
+1. 把推导写进 `tools/calc_frontend.py`（KVL 模型 + 自检码值表 + 实测校验行），
+   所有数字由脚本生成，不再手算。
+2. `User/BSP/Src/Frontend.c` 里只保留**一张两行的标定表**（零点码值、零点 mV、增益分子/分母），
+   换算用 int64 防溢出。
+3. 文档 `FRONTEND_BIAS_DESIGN.md` 第七/八/十一节按新模型重写，并在开头留修订记录。
+
+**经验**
+**纸面推导必须被实测校准一次。**
+这次是"两个实测点"直接把错误模型否掉的——如果只测一个点，很可能会用"标定系数"
+把错误掩盖过去，然后在别的量程上翻车。**用 GND 和 3.3 V 两个已知点反算，
+是最便宜的正确性检查。**
+
+---
+
+### 问题 24：CH2 还没搭电路时读数 3.27 V，看起来像短路
+
+**现象**
+CH2 尚未焊接，读数稳定在 4060~4073（≈3.27 V）、spread 20~50。
+
+**根因**
+PA1 高阻悬空，节点上唯一连接是"防过压肖特基（ADC → 3.3 V）"，
+其**反向漏电流**足以把高阻节点拉到接近 VCC。
+spread 20~50 恰恰证明是高阻（硬短路只有 1~2 的跳动）。
+
+**解决**
+自检程序对"未搭建通道"单独给提示（后来 CH2 搭好后这段特判已删除）；
+`readonly` 的判据是**噪声幅度**：spread 大 = 高阻，spread 极小 = 短路或固定电平。
+
+**经验**
+**悬空引脚读数"贴着电源轨"是正常现象**，不要急着怀疑短路；
+先看噪声幅度，再看是否随手指/探头移动。
+
+---
+
+### 附：10 月 20 日的几处行为变更（是需求，不是 bug）
+
+这些不是故障，但改变了界面行为，复盘时一并记下，免得以后误以为是回归：
+
+| 变更 | 原因 |
+|---|---|
+| 上电停在 `HOLD`，显示 `PRESS KEY4 TO RUN`，按 KEY4 才开始采集 | 避免一上电就用没接线/悬空的输入画出假波形 |
+| `HOLD` 时**保留最后一帧的测量值** | 大多数示波器都这样，冻结画面方便读数；且数据不变时增量刷新一字节都不发 |
+| 双通道共用同一个 V/div（`s_st.vdiv_idx` 从数组改成单值） | 同屏两路用同一套电压-像素换算，避免"看起来一样却读数不同" |
+| V/div 扩到 7 档，并与前端量程联动（`S`/`W`） | 加 10 V/div 才能把大量程 ±33 V 的窗口一屏显示完 |
+| KEY1 只切换"测量通道"，不影响显示通道（KEY3 管显示） | 参数栏只需要一个通道的数值 |
+
+---
+
+## 八、关键 HAL 源码事实（这次调试的真正收获）
 
 以下每一条都是**读 HAL 源码确认**的，不是猜的。它们解释了大量"配置看起来对但不动"的现象：
 
@@ -574,6 +1185,11 @@ GND 共地
 | 7 | `ADC_EOC_SINGLE_CONV = 0x1` 实际把 `CR2.EOCS`（bit10）**置 1**，容易误判为"多出来的位" | `stm32f4xx_hal_adc.h:407-408` |
 | 8 | `ADC->CDR` 低 16 位 = ADC1，高 16 位 = ADC2 | RM0090 |
 | 9 | 寄存器位：`CR2.ADON=bit0`、`CR2.DMA=bit8`、`CR2.DDS=bit9`、`CR2.EOCS=bit10`、`CCR.DDS=bit13` | `stm32f407xx.h` |
+| 10 | **`uxCriticalNesting` 初值是 `0xaaaaaaaa`**，只有 `xPortStartScheduler()` 清 0；`vPortExitCritical()` 仅在计数为 0 时开中断 | `portable/GCC/ARM_CM4F/port.c:161` / `:443` / `:493-502` |
+| 11 | `HAL_ADC_Start()` 仅在 `CR2.EXTEN == 0` 时才置 `SWSTART` | `stm32f4xx_hal_adc.c:797` |
+| 12 | `HAL_ADCEx_MultiModeConfigChannel()` 只写 `CCR` 的 MULTI/DMA/DELAY，**不碰 `CR2`** | `stm32f4xx_hal_adc_ex.c:999-1009` |
+| 13 | `DMA2_Stream0` 由 `HAL_DMA_IRQHandler(&hdma_adc1)` 在中断里推动；普通模式下 `NDTR` 归零即可判定"搬完" | `Core/Src/stm32f4xx_it.c:220-225` |
+| 14 | ST7789 `MADCTL` 的 BGR 位（`0x60`↔`0x68`）决定红蓝是否互换 | ST7789 数据手册 |
 
 **方法论总结**
 
@@ -587,26 +1203,57 @@ GND 共地
 5. **改完一定量一次。** 采样率不是"设 200k 就是 200k"：实测 199744 / 498507 SPS，
    换算成绝对时间是约 6 µs 的**固定启动开销**（不是速率误差，因为 500k 档的偏差并没有放大 5 倍），
    两档比值 2.4957 ≈ 2.5，说明采样间隔本身是准确、线性不漂移的。
+6. **数据形状比报错信息更有用。** "恰好 1 个字"→ 单个 DMA 请求；
+   "零噪声的固定值"→ 数据没更新；"两路完全一样"→ 其中一路没工作；
+   "看起来像 HOLD"→ 其实是画面根本没刷新。**先假设数据没动，再怀疑算法。**
+7. **单位换算只允许存在一处。** ADC 码值 → mV 的零点、增益、量程全部收敛到
+   `Frontend.c` 一张标定表里；View 和 Algorithm 只认"mV（带符号）"。
+   一旦让"码值"和"mV"在多个模块间混用，标定必然散落成好几份，改一处漏三处。
+8. **用已知量校准，而不是相信推导。** 接 GND 得零点、接 3.3 V 得增益，
+   两个点就能把整条链路的换算系数钉死；纸面算错时，实测会立刻把它揭穿（问题 23）。
 
 ---
 
-## 七、当前代码结构
+## 九、当前代码结构
 
 ```
 CMakeLists.txt                     ← User/ 自动收集源文件与头文件目录（问题 1）
+tools/
+  gen_font.py                      ← 生成 5×7 点阵字库；--preview 可预览字形
+  calc_frontend.py                 ← 按 KVL 重算前端偏置参数（问题 23）
 User/
-  BSP/
-    Inc/  ADC_Drv.h                ← ADC 对外 API（业务层唯一需要包含的头文件）
-          ADC_Test.h  ADC_DMA_Test.h  Encoder.h  Key.h  LED.h  SPI.h
-    Src/  ADC_Drv.c                ← 唯一接触 ADC/TIM2/DMA2_Stream0 的实现
+  BSP/                             ← 驱动层：只有这里碰 HAL
+    Inc/  ADC_Drv.h  ADC_SelfCheck.h  Frontend.h
+          Lcd.h  Font.h  EncoderDrv.h  Key.h  LED.h  Encoder.h
+    Src/  ADC_Drv.c                ← 唯一接触 ADC / TIM2 / DMA2_Stream0 的实现
+          Frontend.c               ← 码值 → 输入 mV（零点/增益/量程唯一出处）
+          Lcd.c  Font.c            ← ST7789 SPI 屏 + 5×7 点阵字库（665 B）
+          EncoderDrv.c             ← 两路编码器增量，四倍频折算成每格 1（问题 13）
           Retarget.c               ← printf → USART1（重写 _write，问题 3）
+          ADC_SelfCheck.c          ← 串口自检程序（main.c 开关切换）
           ADC_Test.c  ADC_DMA_Test.c  ← 纯 API 调用示例
-          Encoder.c  Key.c  LED.c  SPI.c
+          Key.c  LED.c  Encoder.c
+  View/                            ← 视图层：只调用 Lcd / Font，不含 HAL
+    Inc/  ScopeView.h              ← 布局常量、配色、StatusBar_Info / WaveView_Data
+    Src/  View.c  WaveView.c       ← 增量刷新、脏行位图、行指纹（6.7 节）
+          StatusBar.c  ParamBar.c  ← 字段级增量
+  Algorithm/                       ← 纯计算，不含任何硬件访问
+    Inc/  Measure.h
+    Src/  Measure.c                ← 峰峰值 / 有效值 / 平均值 / 频率（输入为 mV）
+  App/                             ← 应用层：按键、状态机、编排
+    Inc/  App_Scope.h  ScopeMenu.h
+    Src/  App_Scope.c  ScopeMenu.c
 Core/
-  Src/adc.c   ← USER CODE BEGIN ADC2_Init 2：__HAL_ADC_ENABLE(&hadc2)（问题 8）
-  Src/tim.c   ← USER CODE BEGIN TIM4_Init 2 / TIM8_Init 2：编码器模式启动（问题 4/5）
-  Src/main.c  ← USER CODE 段：ADC_Drv_Init()、printf 头文件
+  Src/adc.c     ← USER CODE BEGIN ADC2_Init 2：__HAL_ADC_ENABLE(&hadc2)（问题 8）
+  Src/tim.c     ← USER CODE TIM4_Init 2 / TIM8_Init 2：编码器模式启动（问题 4/5）
+  Src/spi.c     ← CubeMX 生成，SPI1 模式 3 / 10.5 Mbit/s
+  Src/main.c    ← USER CODE 段：ADC_Drv_Init() → App_Scope_Init()，主循环 App_Scope_Loop()
+                  另含 APP_RUN_SELFCHECK 开关（0 = 示波器界面，1 = 串口自检）
 ```
+
+**分层调用方向（单向，不许反向）**
+`App → View → Lcd/Font`、`App → Algorithm`、`App → ADC_Drv`；
+View 与 Algorithm 都不包含 `adc.h`/`tim.h`，换屏或换采样器件时它们不用改。
 
 **HAL 回调归属约定**
 `HAL_ADC_ConvCpltCallback()` / `HAL_ADC_ErrorCallback()` 由 `ADC_Drv.c` 独占实现，
@@ -618,9 +1265,21 @@ Core/
 
 ---
 
-## 八、遗留 / 待办
+## 十、遗留 / 待办
 
 - [ ] 按键闪烁（问题 11）目前只有方案，未实施。
+- [ ] 双通道的 V/div 目前是**共用同一档**（统一分辨率，便于对比两条线）；
+      菜单里也只能整体调，不能分通道微调。V/div 同时决定前端量程：
+      前 4 档 = 小量程（跳线乙插 `MID`），后 3 档 = 大量程（跳线乙不插），
+      软件检测不到跳线，只能靠状态栏的 `S`/`W` 提醒用户对齐。
+- [ ] **前端标定还只是"设计值 + 单点实测"**，没有做正式的两点标定。
+      建议接 GND 与 3.3 V 各测一次，把实测零点码值写回 `Frontend.c` 的
+      `k_frontend_cal[]`（当前大/小量程零点为 1950 / 1321）。
+- [ ] CH1 的噪声 spread ≈45（约 100 mV）明显大于 CH2 的 14（约 32 mV），
+      两路共用同一 3.3 V 轨 → 疑似 **CH1 缺那颗 100 nF（ADC 节点 ↔ GND）**，
+      它同时决定引脚低通拐点。待硬件确认。
+- [ ] 负电压可测范围由硬件决定（大量程 −33 V、小量程 −3.0 V 为下限），软件无需改动；
+      超过下限会被钳位到 0 附近，表现为 `DC` 贴边、`Vpp` 少一半。
 - [ ] `adc.h` 未导出 `extern DMA_HandleTypeDef hdma_adc1;`，驱动里是自己 `extern` 声明的。
       如果哪天 CubeMX 改了 DMA 句柄名，这里要同步改。
 - [ ] ADC 驱动引用 FreeRTOS API 后，链接器会把内核（含 32 KB 的 `ucHeap`）拉进来，

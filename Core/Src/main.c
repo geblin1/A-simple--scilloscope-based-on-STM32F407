@@ -1,3 +1,11 @@
+/*
+ * @Author: geblin1 3390931275@qq.com
+ * @Date: 2026-10-12 20:10:44
+ * @LastEditors: geblin1 3390931275@qq.com
+ * @LastEditTime: 2026-10-20 22:20:00
+ * @FilePath: \基于STM32F407ZGT6的简易示波器\Core\Src\main.c
+ * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+ */
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
@@ -20,6 +28,7 @@
 #include "main.h"
 #include "adc.h"
 #include "dma.h"
+#include "spi.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -40,6 +49,8 @@
 #include "ADC_Test.h"       /* ADC1/ADC2 自检（User/BSP/Src/ADC_Test.c） */
 #include "ADC_DMA_Test.h"   /* 双 ADC 同步 + DMA 采集测试（User/BSP/Src/ADC_DMA_Test.c） */
 #include "Encoder.h"
+#include "App_Scope.h"      /* 示波器应用层：输入、采集、界面 */
+#include "ADC_SelfCheck.h"  /* 前端偏置改造自检（纯串口输出） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,7 +60,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* 前端改造自检开关：
+   1 = 只跑串口自检（跳过 LCD 初始化），用于核对偏置电路
+   0 = 正常跑示波器界面
+   自检做完后把这里改回 0 重新编译即可，其他代码不用动。 */
+#define APP_RUN_SELFCHECK   0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -110,9 +125,16 @@ int main(void)
   MX_ADC2_Init();
   MX_TIM4_Init();
   MX_TIM2_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   /* ADC 驱动初始化：必须在 MX_ADC1_Init()/MX_ADC2_Init() 之后、开始采集之前 */
   (void)ADC_Drv_Init();
+
+#if (APP_RUN_SELFCHECK == 0)
+  /* 界面初始化：LCD 上电、画框架、装载默认参数
+     必须在 MX_SPI1_Init() 与 ADC_Drv_Init() 之后 */
+  App_Scope_Init();
+#endif
 
   /* 调度器保持关闭；要恢复 FreeRTOS 多任务版本，取消下面这行的注释即可 */
   // freertos_app_start();
@@ -126,6 +148,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+#if (APP_RUN_SELFCHECK != 0)
+    /* 前端偏置自检：每 500 ms 往 USART1 打一行读数 */
+    ADC_SelfCheck_Run();
+#else
+    /* 示波器主循环：处理按键/编码器 -> 采集一帧 -> 重绘 */
+    App_Scope_Loop();
+#endif
   }
   /* USER CODE END 3 */
 }

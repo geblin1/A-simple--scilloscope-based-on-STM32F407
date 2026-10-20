@@ -39,6 +39,7 @@ static volatile uint8_t  s_error;            /* 1 = 本帧出错 */
 static uint32_t          s_arr = 9U;         /* 当前 ARR（对应 100kSPS） */
 static uint32_t          s_rate_hz = 100000U;
 static SemaphoreHandle_t s_done_sem;         /* 帧完成信号量（可能为 NULL） */
+static uint32_t          s_last_ndtr;        /* 停采集瞬间 DMA 剩余计数（诊断用） */
 
 /* ---------------- 内部工具 ---------------- */
 /** @brief 调度器是否已经在跑（ISR 里也安全，只读一个变量） */
@@ -83,6 +84,17 @@ ADC_Drv_Status ADC_Drv_Init(void)
         }
     }
 
+    /* 从器件 ADC2 的两个补丁：
+       1) 清掉可能残留的 OVR —— F4 的 ADC 一旦 OVR 置位就会停止转换，
+          现象正是“上电测了一次，之后数值永远不变”；
+       2) 把主器件的触发配置复制给从器件。双 ADC 同步模式里从器件本该由主器件带动，
+          但本板实测 ADC2 只转换了第一次，显式同源更稳妥。 */
+    hadc2.Instance->SR = 0U;
+    {
+        uint32_t trig = hadc1.Instance->CR2 & (ADC_CR2_EXTSEL | ADC_CR2_EXTEN);
+        hadc2.Instance->CR2 = (hadc2.Instance->CR2 & ~(ADC_CR2_EXTSEL | ADC_CR2_EXTEN)) | trig;
+    }
+
     (void)HAL_TIM_Base_Stop(&htim2);
     hadc1.Instance->CR2 &= ~ADC_CR2_DMA;
 
@@ -105,6 +117,7 @@ ADC_Drv_Status ADC_Drv_ReadOnce(uint16_t *ch1, uint16_t *ch2)
 {
     uint32_t saved_ccr;
     uint32_t saved_exten;
+    uint32_t saved_exten2;
     uint32_t saved_dma;
     uint8_t  ok = 1U;
 
@@ -122,8 +135,14 @@ ADC_Drv_Status ADC_Drv_ReadOnce(uint16_t *ch1, uint16_t *ch2)
     ADC->CCR    = saved_ccr & ~(ADC_CCR_MULTI | ADC_CCR_DMA);
     saved_exten = hadc1.Instance->CR2 & ADC_CR2_EXTEN;
     saved_dma   = hadc1.Instance->CR2 & ADC_CR2_DMA;
+    /* 从器件 ADC2 的触发边沿也要一起清掉：
+       ADC_Drv_Init() 把 ADC1 的 EXTSEL/EXTEN 复制给了 ADC2，若只清 ADC1，
+       则 HAL_ADC_Start(&hadc2) 因 EXTEN != 0 不会置 SWSTART，ADC2 永远等不到转换。
+       （HAL 只允许“无外部触发”时才软件启动，见 stm32f4xx_hal_adc.c:797） */
+    saved_exten2 = hadc2.Instance->CR2 & ADC_CR2_EXTEN;
     /* CR2.DMA 必须清掉：EOCS+DMA 同时置位时 HAL_ADC_PollForConversion 会立即返回 HAL_ERROR */
     hadc1.Instance->CR2 &= ~(ADC_CR2_EXTEN | ADC_CR2_DMA);
+    hadc2.Instance->CR2 &= ~(ADC_CR2_EXTEN | ADC_CR2_DMA);
 
     __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_EOC | ADC_FLAG_OVR);
     __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_EOC | ADC_FLAG_OVR);
@@ -150,6 +169,7 @@ ADC_Drv_Status ADC_Drv_ReadOnce(uint16_t *ch1, uint16_t *ch2)
 
     /* 原样恢复多 ADC 配置和触发边沿，不影响后续帧采集 */
     hadc1.Instance->CR2 |= (saved_exten | saved_dma);
+    hadc2.Instance->CR2 |= saved_exten2;
     ADC->CCR = saved_ccr;
 
     return (ok != 0U) ? ADC_DRV_OK : ADC_DRV_TIMEOUT;
@@ -233,16 +253,43 @@ ADC_Drv_Status ADC_Drv_CaptureStart(uint32_t *buf, uint32_t len)
         return ADC_DRV_PARAM;
     }
 
-    taskENTER_CRITICAL();
-    if (s_busy != 0U)
+    /* 进入临界区保护 s_busy / s_done / s_error。
+       注意：调度器没启动时**不能**用 taskENTER_CRITICAL()。
+       FreeRTOS 的 uxCriticalNesting 初值是 0xAAAAAAAA，只有 xPortStartScheduler()
+       才会把它清 0；调度器没起来时 taskEXIT_CRITICAL() 的计数永远回不到 0，
+       portENABLE_INTERRUPTS() 就不会执行 —— PRIMASK 一直是 1，
+       所有中断（TIM7 时基、DMA 完成）全部被关死。
+       所以这里按"调度器是否在跑"分别用 FreeRTOS 临界区 / 裸 PRIMASK 保存-恢复。 */
+    if (adc_drv_sched_running() == pdTRUE)
     {
+        taskENTER_CRITICAL();
+
+        if (s_busy != 0U)
+        {
+            taskEXIT_CRITICAL();
+            return ADC_DRV_BUSY;
+        }
+        s_busy  = 1U;
+        s_done  = 0U;
+        s_error = 0U;
+
         taskEXIT_CRITICAL();
-        return ADC_DRV_BUSY;
     }
-    s_busy  = 1U;
-    s_done  = 0U;
-    s_error = 0U;
-    taskEXIT_CRITICAL();
+    else
+    {
+        uint32_t primask = __get_PRIMASK();
+
+        __disable_irq();
+        if (s_busy != 0U)
+        {
+            __set_PRIMASK(primask);
+            return ADC_DRV_BUSY;
+        }
+        s_busy  = 1U;
+        s_done  = 0U;
+        s_error = 0U;
+        __set_PRIMASK(primask);
+    }
 
     /* 若上一帧只查了 IsDone 没调 Stop，这里先彻底释放一次，保证可重启 */
     (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
@@ -255,6 +302,8 @@ ADC_Drv_Status ADC_Drv_CaptureStart(uint32_t *buf, uint32_t len)
     }
 
     __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_EOC | ADC_FLAG_OVR);
+    /* 从器件同样要清：ADC2 一旦 OVR 置位就不再转换，CDR 的高 16 位会一直停在旧值 */
+    hadc2.Instance->SR = 0U;
 
     /* 多 ADC 模式下 DMA 请求由主器件的 CR2.DMA 开门，HAL 不会替我们置这一位 */
     hadc1.Instance->CR2 |= ADC_CR2_DMA;
@@ -307,6 +356,13 @@ ADC_Drv_Status ADC_Drv_CaptureWait(uint32_t timeout_ms)
 
         while (s_done == 0U)
         {
+            /* 第二重完成判据：普通模式下 NDTR 归零就代表这一帧已经搬完。
+               即使完成中断因为某种原因没进来，这里也能正确收尾。 */
+            if (hdma_adc1.Instance->NDTR == 0U)
+            {
+                s_done = 1U;
+                break;
+            }
             if ((HAL_GetTick() - start) >= timeout_ms)
             {
                 break;
@@ -321,7 +377,15 @@ ADC_Drv_Status ADC_Drv_CaptureWait(uint32_t timeout_ms)
 
     ADC_Drv_CaptureStop();
 
-    if ((ret == ADC_DRV_OK) && (s_error != 0U))
+    /* 数据完整性优先：整帧搬满（NDTR 归零）就算成功。
+       帧尾那一两个转换没有被 DMA 接收而置 OVR，只说明多发了一次触发，
+       不影响已经搬进缓冲区的点，不应该把整帧判成失败——
+       否则上层会一直认为"没采到"，出现"波形在动、测量值不动"的怪现象。 */
+    if ((s_done != 0U) && (s_last_ndtr == 0U))
+    {
+        ret = ADC_DRV_OK;
+    }
+    else if ((ret == ADC_DRV_OK) && (s_error != 0U))
     {
         ret = ADC_DRV_ERROR;
     }
@@ -344,11 +408,19 @@ uint32_t ADC_Drv_CaptureRemaining(void)
 
 ADC_Drv_Status ADC_Drv_CaptureStop(void)
 {
+    /* 停之前先记下 DMA 还剩多少没搬（0 = 已搬满），供诊断使用 */
+    s_last_ndtr = (uint32_t)hdma_adc1.Instance->NDTR;
+
     (void)HAL_TIM_Base_Stop(&htim2);
     (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
     hadc1.Instance->CR2 &= ~ADC_CR2_DMA;
     s_busy = 0U;
     return ADC_DRV_OK;
+}
+
+uint32_t ADC_Drv_GetLastRemaining(void)
+{
+    return s_last_ndtr;
 }
 
 /* ---------------- 辅助 ---------------- */
