@@ -46,11 +46,14 @@
 #include "LED.h"
 #include <stdio.h>          /* printf: 已由 User/BSP/Src/Retarget.c 重定向到 USART1 */
 #include "ADC_Drv.h"        /* 双 ADC 采集驱动：业务层只调这里的接口 */
+#include "Frontend.h"       /* 前端标定表：上电从 flash 读回逐通道逐量程参数 */
 #include "ADC_Test.h"       /* ADC1/ADC2 自检（User/BSP/Src/ADC_Test.c） */
 #include "ADC_DMA_Test.h"   /* 双 ADC 同步 + DMA 采集测试（User/BSP/Src/ADC_DMA_Test.c） */
 #include "Encoder.h"
 #include "App_Scope.h"      /* 示波器应用层：输入、采集、界面 */
+#include "App_Rtos.h"       /* 任务层：采集 / 界面 / 监控三个任务 */
 #include "ADC_SelfCheck.h"  /* 前端偏置改造自检（纯串口输出） */
+#include "ADC_NoiseTest.h"  /* 噪声 A/B 对比：判断刷屏耦合还是前端本身（串口输出） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,6 +68,13 @@
    0 = 正常跑示波器界面
    自检做完后把这里改回 0 重新编译即可，其他代码不用动。 */
 #define APP_RUN_SELFCHECK   0
+
+/* 噪声 A/B 对比开关：
+   1 = 只跑 A/B 对比并串口打印（不启动 RTOS，但需要 LCD 初始化正常），
+   0 = 正常跑示波器界面。
+   用途：判断"波形噪声大"是 LCD 刷屏耦合进采样窗口，还是前端电路本身，
+   拿到数字后改回 0 即可。 */
+#define APP_RUN_NOISETEST   0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -130,14 +140,24 @@ int main(void)
   /* ADC 驱动初始化：必须在 MX_ADC1_Init()/MX_ADC2_Init() 之后、开始采集之前 */
   (void)ADC_Drv_Init();
 
-#if (APP_RUN_SELFCHECK == 0)
-  /* 界面初始化：LCD 上电、画框架、装载默认参数
-     必须在 MX_SPI1_Init() 与 ADC_Drv_Init() 之后 */
-  App_Scope_Init();
-#endif
+  /* 前端标定表初始化：优先从 flash 扇区 11 读回上次的两点标定结果，
+     读不到（首上电 / 校验失败）就用设计默认值。必须在任何采集之前。 */
+  Frontend_Init();
 
-  /* 调度器保持关闭；要恢复 FreeRTOS 多任务版本，取消下面这行的注释即可 */
-  // freertos_app_start();
+#if (APP_RUN_SELFCHECK != 0)
+  /* 前端自检模式：不初始化 LCD、不启动调度器，直接走下面的裸机循环 */
+#elif (APP_RUN_NOISETEST != 0)
+  /* 噪声 A/B 模式：需要 LCD 与视图层就绪，但不启动调度器 */
+  App_Scope_Init();
+#else
+  /* 界面初始化：LCD 上电、画框架、装载默认参数
+     必须在 MX_SPI1_Init() 与 ADC_Drv_Init() 之后、调度器启动之前 */
+  App_Scope_Init();
+
+  /* 创建采集 / 界面 / 监控三个任务并启动调度器；正常情况下不返回。
+     自检模式（APP_RUN_SELFCHECK == 1）不启动 RTOS，走下面的裸机循环。 */
+  App_Rtos_Start();
+#endif
 
   /* USER CODE END 2 */
 
@@ -149,11 +169,14 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 #if (APP_RUN_SELFCHECK != 0)
-    /* 前端偏置自检：每 500 ms 往 USART1 打一行读数 */
+    /* 前端偏置自检（裸机模式）：每 500 ms 往 USART1 打一行读数 */
     ADC_SelfCheck_Run();
+#elif (APP_RUN_NOISETEST != 0)
+    /* 噪声 A/B 对比（裸机模式）：先不刷屏采一组、再边刷屏边采一组 */
+    ADC_NoiseTest_Run();
 #else
-    /* 示波器主循环：处理按键/编码器 -> 采集一帧 -> 重绘 */
-    App_Scope_Loop();
+    /* 正常模式走不到这里：App_Rtos_Start() 启动调度器后不返回。
+       采集与界面由 acq / ui 两个任务分别推进，见 User/App/Src/App_Rtos.c。 */
 #endif
   }
   /* USER CODE END 3 */
@@ -229,6 +252,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM7)
   {
     Key_Tick();
+    /* LED 心跳：每 500 ms 翻转一次，RUN / HOLD 都一样。
+       放在 1 ms 中断里而不是任务里——界面任务刷一帧要几十毫秒，
+       低优先级任务会被饿死，放任务里闪烁就不准了。 */
+    LED_Tick();
   }
   /* USER CODE END Callback 1 */
 }

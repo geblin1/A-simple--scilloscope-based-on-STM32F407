@@ -38,6 +38,8 @@ static uint8_t  s_dirty[WAVE_DIRTY_BYTES];
 static uint32_t s_row_hash[VIEW_WAVE_H];          /* 每行上次真正推出去时的指纹 */
 static uint8_t  s_row_ready;                      /* 行模板是否已生成 */
 static uint8_t  s_valid;                          /* 1 = 屏幕与 s_prev_y 一致 */
+static int16_t  s_prev_trig_y;                    /* 上一帧触发电平线所在行（trig_state=0 时无效） */
+static uint8_t  s_prev_trig_state;
 
 /* ---------------- 坐标换算 ---------------- */
 static int16_t Wave_ClampY(int32_t y)
@@ -284,6 +286,32 @@ static void Wave_OverlayRow(uint16_t *buf, const int16_t *cur, uint16_t count,
     }
 }
 
+/* 触发电平标记：电平所在行画一条"2 像素亮、2 像素灭"的虚线，
+   再在左端画一个小方块，和波形/网格区分开。
+   锁定（state=1）用灰色，表示"已找到触发点"；
+   未锁定（state=2）用红色，提示"当前没有触发，画面还在自由滚动"。
+   虚线只占一半像素，波形压在下面时仍能看清。 */
+static void Wave_OverlayTrigger(uint16_t *buf, uint8_t state)
+{
+    uint16_t x;
+    uint16_t color = (state == 1U) ? VIEW_COLOR_LABEL : VIEW_COLOR_SELECT;
+    uint16_t last  = (uint16_t)(VIEW_W - 1U);
+
+    for (x = 2U; x < last; x += 4U)
+    {
+        buf[x] = color;
+        if ((uint16_t)(x + 1U) < last)
+        {
+            buf[x + 1U] = color;
+        }
+    }
+
+    for (x = 1U; x <= 5U; x++)
+    {
+        buf[x] = color;
+    }
+}
+
 /* 行内容指纹（FNV-1a）。用来跳过"标脏了但合成后其实没变"的行——
    矩形波、稳定波形的大部分行都属于这种情况，能再省一大截 SPI 流量。
    32 位哈希碰撞概率极低，万一撞上也只是那一行晚一帧刷新，看不出来。 */
@@ -302,8 +330,10 @@ static uint32_t Wave_HashRow(const uint16_t *buf)
     return h;
 }
 
-/* 把所有脏行合成并推出去 */
-static void Wave_FlushRows(uint16_t count, uint8_t show1, uint8_t show2)
+/* 把所有脏行合成并推出去。
+   trig_state != 0 时，trig_y 所在行还会叠加触发电平标记。 */
+static void Wave_FlushRows(uint16_t count, uint8_t show1, uint8_t show2,
+                           int16_t trig_y, uint8_t trig_state)
 {
     uint16_t row;
     uint16_t x;
@@ -341,6 +371,12 @@ static void Wave_FlushRows(uint16_t count, uint8_t show1, uint8_t show2)
             Wave_OverlayRow(s_row_buf, s_cur_y2, count, (int16_t)y, VIEW_COLOR_CH2);
         }
 
+        /* 触发电平标记画在波形之上：它是一条"参考线"，不应该被曲线盖住 */
+        if ((trig_state != 0U) && ((int16_t)y == trig_y))
+        {
+            Wave_OverlayTrigger(s_row_buf, trig_state);
+        }
+
         /* 合成结果与屏幕上已有的完全一样就不用再发一遍 */
         hash = Wave_HashRow(s_row_buf);
         if ((s_valid != 0U) && (s_row_hash[row] == hash))
@@ -360,6 +396,8 @@ void WaveView_DrawTrace(const WaveView_Data *data)
     uint16_t i;
     uint8_t  show1;
     uint8_t  show2;
+    uint8_t  trig_state;
+    int16_t  trig_y = 0;
 
     if ((data == 0) || (data->count == 0U))
     {
@@ -378,6 +416,14 @@ void WaveView_DrawTrace(const WaveView_Data *data)
 
     show1 = ((data->show1 != 0U) && (data->ch1 != 0)) ? 1U : 0U;
     show2 = ((data->show2 != 0U) && (data->ch2 != 0)) ? 1U : 0U;
+
+    /* 触发电平线：只有触发开启时才画。电平可能超出 ±5 格的可视范围，
+       Wave_SampleToY 会把它钳在波形区的上下边框上。 */
+    trig_state = data->trig_state;
+    if (trig_state != 0U)
+    {
+        trig_y = Wave_SampleToY(data->trig_mv, data->vdiv_mv1);
+    }
 
     if (s_row_ready == 0U)
     {
@@ -418,14 +464,27 @@ void WaveView_DrawTrace(const WaveView_Data *data)
         {
             Wave_MarkPrev(s_prev_y2, count);
         }
+
+        /* 电平线移动 / 开关 / 锁定状态变化，都要把涉及的行重画：
+           旧位置擦掉，新位置画上。 */
+        if (s_prev_trig_state != 0U)
+        {
+            Wave_DirtyRange(s_prev_trig_y, s_prev_trig_y);
+        }
+        if (trig_state != 0U)
+        {
+            Wave_DirtyRange(trig_y, trig_y);
+        }
     }
 
     /* 3. 合成脏行并推送 */
-    Wave_FlushRows(count, show1, show2);
+    Wave_FlushRows(count, show1, show2, trig_y, trig_state);
 
     /* 4. 记录本帧位置 */
     (void)memcpy(s_prev_y1, s_cur_y1, (size_t)count * sizeof(s_prev_y1[0]));
     (void)memcpy(s_prev_y2, s_cur_y2, (size_t)count * sizeof(s_prev_y2[0]));
+    s_prev_trig_y     = trig_y;
+    s_prev_trig_state = trig_state;
     s_valid = 1U;
 }
 
@@ -444,9 +503,9 @@ void WaveView_DrawMessage(const char *text)
     x = (uint16_t)((VIEW_W - w) / 2U);
     y = (uint16_t)(VIEW_WAVE_MID_Y - (FONT_SMALL_HEIGHT / 2U));
 
-    /* 用背景色铺一条，保证文字在网格上也清楚 */
-    Lcd_FillRect((uint16_t)(x - 6U), y, (uint16_t)(w + 12U),
-                 (uint16_t)FONT_SMALL_HEIGHT, VIEW_COLOR_BG);
+    /* 用背景色铺一条，保证文字在网格上也清楚。
+       铺满整行：标定提示会换不同长度的字符串，窄条会留下上一句的残影。 */
+    Lcd_FillRect(0U, y, (uint16_t)VIEW_W, (uint16_t)FONT_SMALL_HEIGHT, VIEW_COLOR_BG);
     (void)Lcd_DrawString(x, y, text, FONT_SMALL, VIEW_COLOR_TEXT, VIEW_COLOR_BG);
 
     s_valid = 0U;                                 /* 文字压在网格上，下次整片重画 */

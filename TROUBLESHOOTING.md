@@ -1,6 +1,6 @@
 # 调试问题复盘（Troubleshooting Log）
 
-> 项目：基于 STM32F407ZGT6 的简易示波器（ADC 双通道同步采样 + 信号发生器 + 万用表）
+> 项目：基于 STM32F407ZGT6 的简易示波器（ADC 双通道同步采样 + 偏置前端 + ST7789 显示 + FreeRTOS 三任务）
 > 工具链：STM32CubeMX 生成 + CMake/Ninja + arm-none-eabi-gcc 14.3.1 + HAL + FreeRTOS
 > 本文记录开发过程中实际踩到的坑：**现象 → 根因 → 定位过程 → 解决 → 验证**，
 > 便于日后复盘。每条都对应真实发生过的故障，不是假设。
@@ -35,6 +35,15 @@
 | 22 | 帧率只有约 8 fps | 每帧整片重画 166 KB，而 SPI 只有 1.31 MB/s |
 | 23 | 零点/增益算错，实测与纸面对不上 | 把 `R_th`(500 Ω) 当成 `R_down`(1000 Ω)，`Rs` 其实与它**并联** |
 | 24 | CH2 没搭建时读数 3.27 V，像短路 | 高阻悬空被防过压肖特基的反向漏电流拉高 |
+| 25 | 任务化改造后编译报 `App_Scope_Loop` 未声明 | 接口重构删掉了旧主循环，`main.c` 的调用点没同步 |
+| 26 | RUN 之后 LED 闪烁忽快忽慢（HOLD 时正常） | 界面任务画一帧几十毫秒、`vTaskDelayUntil` 立刻返回，低优先级监控任务被饿死 |
+| 27 | HOLD 后按 KEY1 切通道，参数栏仍是原通道的数据 | 交接帧里只带了一份测量结果，采集时就绑定了当时的选中通道 |
+| 28 | 上 FreeRTOS 后波形噪声明显变大（裸机版很干净） | 采集与刷屏从"串行"变成"并行"，SPI 突发在 3.3 V/地上打尖峰，经偏置电阻灌进 ADC 节点 |
+| 29 | 波形一直左右抖动、周期信号不"钉"屏 | 自由采样没有触发点，每帧起始相位随机（是"抖"不是"噪"） |
+| 30 | 打开触发后刷新率掉回 8 fps 量级 | 触发点只对齐到采样网格，波形每帧横向差 ±1 像素，行指纹全部失效 |
+| 31 | 单极性 PWM / 逻辑信号怎么调电平都钉不住 | 默认电平 0 mV 在单极性信号幅度之外，AUTO 电平（信号中点）缺失 |
+| 32 | 按 KEY4 开始采集后，按键/编码器要十几秒才响应一次 | 互斥量 give 只唤醒、不转移所有权，优先级更高的采集任务反复截胡总线锁，界面任务被饿死 |
+| 33 | CH1 和 CH2 读数不一致 / 只有 CH1 标定过 | 标定表只按量程分、两通道共用，且没有设备端标定入口；CH2 从未实测过 |
 
 ---
 
@@ -1167,6 +1176,7 @@ spread 20~50 恰恰证明是高阻（硬短路只有 1~2 的跳动）。
 | 双通道共用同一个 V/div（`s_st.vdiv_idx` 从数组改成单值） | 同屏两路用同一套电压-像素换算，避免"看起来一样却读数不同" |
 | V/div 扩到 7 档，并与前端量程联动（`S`/`W`） | 加 10 V/div 才能把大量程 ±33 V 的窗口一屏显示完 |
 | KEY1 只切换"测量通道"，不影响显示通道（KEY3 管显示） | 参数栏只需要一个通道的数值 |
+| （10 月 22 日更新）KEY1 在切测量通道的同时把触发源也切到该通道 | 否则会出现"选中的通道没被钉住、没选中的反而被钉住"（见问题 33 补充） |
 
 ---
 
@@ -1216,65 +1226,126 @@ spread 20~50 恰恰证明是高阻（硬短路只有 1~2 的跳动）。
 
 ## 九、当前代码结构
 
+> 这一节按**实际在编译、实际在运行**的文件重写（10 月 22 日）。标了“历史 / 未调用”的是早期调试留下的，保留但不参与当前流程。
+
 ```
-CMakeLists.txt                     ← User/ 自动收集源文件与头文件目录（问题 1）
+CMakeLists.txt                          ← 工程入口：User/ 自动收集 + FreeRTOS 内核/移植层 + 启停钩子
+CMakePresets.json                       ← Ninja + arm-none-eabi 预设
+STM32F407xx_FLASH.ld                    ← FLASH 1 MB / RAM 128 KB / CCMRAM 64 KB（标定占扇区 11）
+startup_stm32f407xx.s                   ← 启动文件（向量表、Reset_Handler）
+基于STM32F407ZGT6的简易示波器.ioc         ← CubeMX 工程；重新生成会改写 Core/（USER CODE 段保留）
+
+cmake/
+  gcc-arm-none-eabi.cmake               ← 工具链定义（CPU / FPU / 浮点 ABI）
+  starm-clang.cmake                     ← 备用 clang 工具链
+  stm32cubemx/CMakeLists.txt            ← CubeMX 管理的源码清单（不含 freertos_app.c / freertos_hooks.c）
+
 tools/
-  gen_font.py                      ← 生成 5×7 点阵字库；--preview 可预览字形
-  calc_frontend.py                 ← 按 KVL 重算前端偏置参数（问题 23）
+  gen_font.py                           ← 生成 5×7 点阵字库（Lcd / Font 用）
+  calc_frontend.py                      ← 按 KVL 重算前端偏置参数（问题 23 的模型）
+
+ThirdParty/FreeRTOS/
+  README.md
+  Source/                               ← 内核：tasks.c queue.c list.c timers.c 等
+  Source/portable/GCC/ARM_CM4F/         ← Cortex-M4F 移植层（port.c、heap_4.c）
+
 User/
-  BSP/                             ← 驱动层：只有这里碰 HAL
-    Inc/  ADC_Drv.h  ADC_SelfCheck.h  Frontend.h
-          Lcd.h  Font.h  EncoderDrv.h  Key.h  LED.h  Encoder.h
-    Src/  ADC_Drv.c                ← 唯一接触 ADC / TIM2 / DMA2_Stream0 的实现
-          Frontend.c               ← 码值 → 输入 mV（零点/增益/量程唯一出处）
-          Lcd.c  Font.c            ← ST7789 SPI 屏 + 5×7 点阵字库（665 B）
-          EncoderDrv.c             ← 两路编码器增量，四倍频折算成每格 1（问题 13）
-          Retarget.c               ← printf → USART1（重写 _write，问题 3）
-          ADC_SelfCheck.c          ← 串口自检程序（main.c 开关切换）
-          ADC_Test.c  ADC_DMA_Test.c  ← 纯 API 调用示例
-          Key.c  LED.c  Encoder.c
-  View/                            ← 视图层：只调用 Lcd / Font，不含 HAL
-    Inc/  ScopeView.h              ← 布局常量、配色、StatusBar_Info / WaveView_Data
-    Src/  View.c  WaveView.c       ← 增量刷新、脏行位图、行指纹（6.7 节）
-          StatusBar.c  ParamBar.c  ← 字段级增量
-  Algorithm/                       ← 纯计算，不含任何硬件访问
-    Inc/  Measure.h
-    Src/  Measure.c                ← 峰峰值 / 有效值 / 平均值 / 频率（输入为 mV）
-  App/                             ← 应用层：按键、状态机、编排
-    Inc/  App_Scope.h  ScopeMenu.h
-    Src/  App_Scope.c  ScopeMenu.c
+  BSP/                                  ← 驱动层：只有这里碰 HAL
+    Inc/  ADC_Drv.h  Frontend.h  Lcd.h  Font.h
+          EncoderDrv.h  Key.h  LED.h
+          ADC_SelfCheck.h               ← 裸机自检（main.c 开关切换）
+          ADC_Test.h  ADC_DMA_Test.h  Encoder.h    ← 历史测试 / 旧编码器，现未调用
+    Src/  ADC_Drv.c                     ← 唯一接触 ADC / TIM2 / DMA2_Stream0 的实现
+          Frontend.c                    ← 逐通道×逐量程标定、raw→mV、flash 扇区 11 读写
+          Lcd.c  Font.c                 ← ST7789 SPI 屏 + 字库
+          EncoderDrv.c                  ← TIM8 / TIM4 硬件编码器，四倍频折算成“格”
+          Key.c                         ← TIM7 1 ms 中断里 20 ms 消抖、松手沿锁存
+          LED.c                         ← 1 ms tick 驱动 500 ms 闪烁（中断里调用）
+          Retarget.c                    ← printf → USART1（重写 _write）
+          ADC_SelfCheck.c               ← 串口自检程序
+          ADC_Test.c  ADC_DMA_Test.c  Encoder.c   ← 历史测试 / 旧编码器，现未调用
+  View/                                 ← 视图层：只调 Lcd / Font，不含 HAL
+    Inc/  ScopeView.h                   ← 布局常量、配色、各 *Info 结构 + WaveView_Data
+    Src/  View.c                        ← 整屏换底（上电 / 换页）
+          WaveView.c                    ← 增量刷新、脏行、行指纹、触发电平标记
+          StatusBar.c  ParamBar.c       ← 状态栏 / 参数栏（字段级增量）
+  Algorithm/                            ← 纯计算：不包含任何硬件头文件
+    Inc/  Measure.h  Trigger.h
+    Src/  Measure.c                     ← 峰峰值 / 有效值 / 平均值 / 频率
+          Trigger.c                     ← 迟滞触发查找，返回 index + frac_q16（亚采样位置）
+  App/                                  ← 应用层：输入、状态机、编排
+    Inc/  App_Scope.h  ScopeMenu.h  App_Rtos.h  ADC_NoiseTest.h
+    Src/  App_Scope.c                   ← AcqStep / UiStep：采集、触发、测量、菜单、标定
+          App_Rtos.c                    ← 三个任务 + 启动调度器
+          ScopeMenu.c                   ← 220×150 设置弹窗（6 行）
+          ADC_NoiseTest.c               ← 裸机噪声 A/B 对比（main.c 开关切换）
+
 Core/
-  Src/adc.c     ← USER CODE BEGIN ADC2_Init 2：__HAL_ADC_ENABLE(&hadc2)（问题 8）
-  Src/tim.c     ← USER CODE TIM4_Init 2 / TIM8_Init 2：编码器模式启动（问题 4/5）
-  Src/spi.c     ← CubeMX 生成，SPI1 模式 3 / 10.5 Mbit/s
-  Src/main.c    ← USER CODE 段：ADC_Drv_Init() → App_Scope_Init()，主循环 App_Scope_Loop()
-                  另含 APP_RUN_SELFCHECK 开关（0 = 示波器界面，1 = 串口自检）
+  Inc/  FreeRTOSConfig.h                ← 1 kHz 时基、8 个优先级、32 KB 堆、断言钩子
+        adc.h  dma.h  spi.h  tim.h  usart.h  gpio.h  main.h
+        stm32f4xx_hal_conf.h  stm32f4xx_it.h  freertos_app.h
+  Src/
+        main.c                          ← ADC_Drv_Init() → Frontend_Init() → App_Scope_Init() → App_Rtos_Start()
+                                          （另有 APP_RUN_SELFCHECK / APP_RUN_NOISETEST 两个裸机开关）
+        adc.c                           ← USER CODE：ADC2 要补 __HAL_ADC_ENABLE（问题 8）
+        tim.c                           ← USER CODE：TIM4 / TIM8 编码器模式启动（问题 4 / 5）
+        spi.c                           ← SPI1 模式 3、10.5 Mbit/s
+        stm32f4xx_hal_timebase_tim.c    ← HAL 时基改用 TIM7（SysTick 让给 FreeRTOS）
+        stm32f4xx_it.c                  ← DMA2_Stream0 / TIM7 等 IRQ；SVC/PendSV/SysTick 被宏改名
+        freertos_app.c                  ← 手写的 RTOS 示例入口（队列 + 软件定时器），编译但未调用
+        freertos_hooks.c                ← configASSERT / 栈溢出 / 堆耗尽钩子（死循环 + 现场变量）
+        dma.c  gpio.c  usart.c          ← CubeMX 外设初始化
+        stm32f4xx_hal_msp.c  system_stm32f4xx.c  sysmem.c  syscalls.c
 ```
 
 **分层调用方向（单向，不许反向）**
-`App → View → Lcd/Font`、`App → Algorithm`、`App → ADC_Drv`；
-View 与 Algorithm 都不包含 `adc.h`/`tim.h`，换屏或换采样器件时它们不用改。
+
+`App → View（Lcd / Font）`、`App → Algorithm`、`App → BSP（ADC_Drv / Frontend / Key / EncoderDrv / LED）`。
+`View` 与 `Algorithm` 都不包含 `adc.h` / `tim.h` / `FreeRTOS.h`，换屏、换采样器件时不用改它们。
+只有 `App` 同时看到 FreeRTOS（互斥量、任务节拍）和业务状态。
+
+**任务层与业务层的分工**
+
+`App_Rtos.c` 只负责“谁、什么优先级、多少栈、什么节拍”；业务拆成
+`App_Scope_AcqStep()`（采一帧 → 触发 → 测量 → 发布）与 `App_Scope_UiStep()`（处理一次输入 → 绘制 / 标定状态机）。
+两个步进函数都**不创建任务、不按节拍阻塞等待**，所以同一套业务代码
+裸机轮询与 RTOS 调度两用，任务层可整体替换而不动业务逻辑。
 
 **HAL 回调归属约定**
+
 `HAL_ADC_ConvCpltCallback()` / `HAL_ADC_ErrorCallback()` 由 `ADC_Drv.c` 独占实现，
 业务层不要再重复定义（会链接冲突）。
+`Core/Src/stm32f4xx_it.c` 里 CubeMX 生成的 `SVC_Handler` / `PendSV_Handler` / `SysTick_Handler`
+在编译时被 CMake 宏改名成 `CubeMX_Unused_*`，把三个异常让给 FreeRTOS 移植层，
+避免与 `port.c` 重复定义。
 
 **DMA 缓冲区约束**
+
 采集缓冲区必须放在 SRAM，**不能放 CCMRAM**——DMA1/DMA2 访问不到 CCMRAM
 （F4 的 CCMRAM 只挂在 CPU 的 D-bus 上）。分配时用普通全局数组即可。
+
+**文件是怎么进编译的**
+
+- `User/**`：根 `CMakeLists.txt` 用 `file(GLOB_RECURSE ... CONFIGURE_DEPENDS)` 自动收集 `.c` / `.h`，
+  并自动把各 `Inc` 目录加进 include path；新增文件不用改 CMake。
+- `Core/Src`：由 `cmake/stm32cubemx/CMakeLists.txt` 的固定清单列出（CubeMX 生成）；
+  `freertos_app.c` / `freertos_hooks.c` 与 FreeRTOS 内核由根 `CMakeLists.txt` 手工追加。
+- 根 `CMakeLists.txt` 是 "generated only once"，CubeMX 重新生成代码不会覆盖它；`User/` 也不归 CubeMX 管。
 
 ---
 
 ## 十、遗留 / 待办
 
-- [ ] 按键闪烁（问题 11）目前只有方案，未实施。
+- [x] ~~按键闪烁（问题 11）~~：**已由 TIM7 的 1 ms 中断驱动**（`LED_Tick()`）——
+      **每 500 ms 翻转一次，RUN 与 HOLD 相同**。节奏只由硬件定时器决定，
+      界面刷屏再慢也不会让灯忽快忽慢（踩过的坑见问题 26）。
 - [ ] 双通道的 V/div 目前是**共用同一档**（统一分辨率，便于对比两条线）；
       菜单里也只能整体调，不能分通道微调。V/div 同时决定前端量程：
       前 4 档 = 小量程（跳线乙插 `MID`），后 3 档 = 大量程（跳线乙不插），
       软件检测不到跳线，只能靠状态栏的 `S`/`W` 提醒用户对齐。
-- [ ] **前端标定还只是"设计值 + 单点实测"**，没有做正式的两点标定。
-      建议接 GND 与 3.3 V 各测一次，把实测零点码值写回 `Frontend.c` 的
-      `k_frontend_cal[]`（当前大/小量程零点为 1950 / 1321）。
+- [x] ~~前端标定还只是"设计值 + 单点实测"~~：**已实现逐通道 × 逐量程两点标定**
+      （接 GND 记零点、接 3.3 V 记满点；KEY1 选通道、KEY4 采样，结果存 flash 扇区 11）。
+      上电 `Frontend_Init()` 读回，校验失败才退回设计默认值（1950 / 1321）。见第十四节。
 - [ ] CH1 的噪声 spread ≈45（约 100 mV）明显大于 CH2 的 14（约 32 mV），
       两路共用同一 3.3 V 轨 → 疑似 **CH1 缺那颗 100 nF（ADC 节点 ↔ GND）**，
       它同时决定引脚低通拐点。待硬件确认。
@@ -1282,8 +1353,995 @@ View 与 Algorithm 都不包含 `adc.h`/`tim.h`，换屏或换采样器件时它
       超过下限会被钳位到 0 附近，表现为 `DC` 贴边、`Vpp` 少一半。
 - [ ] `adc.h` 未导出 `extern DMA_HandleTypeDef hdma_adc1;`，驱动里是自己 `extern` 声明的。
       如果哪天 CubeMX 改了 DMA 句柄名，这里要同步改。
-- [ ] ADC 驱动引用 FreeRTOS API 后，链接器会把内核（含 32 KB 的 `ucHeap`）拉进来，
-      RAM 从约 3 KB 涨到约 35 KB。这是启用任务调度后必然要用的堆；
-      若长时间跑裸机，可加编译开关（`ADC_DRV_USE_FREERTOS 0/1`）省掉。
+- [x] ~~ADC 驱动的 FreeRTOS 适配~~：驱动内部按 `xTaskGetSchedulerState()` 自动分支，
+      不再需要编译开关。当前（含 640 点触发采集、调度修复与逐通道标定）实测
+      **RAM 56 088 B (42.79 %)**、**FLASH 64 120 B (6.11 %)**；其中 `ucHeap` 32 KB、
+      三个任务实占约 6.5 KB，触发功能的 640 点缓冲另占约 3.8 KB。
+- [ ] 若要继续压 RAM：`configTOTAL_HEAP_SIZE` 可从 32 KB 降到 16 KB（当前余量充足），
+      但会让"堆不足"从不可能变成需要留意，建议先跑一段时间看 `g_monHeapFree` 再定。
 - [ ] 采样率上限受 ADC 采样时间限制：3 cycles 采样 + 12 cycles 转换 = 15 cycles @21 MHz
       ≈ 714 ns，理论上限约 1.4 MSPS；驱动对外限制到 1 MSPS。
+
+---
+
+## 十一、FreeRTOS 任务化（10 月 21 日）
+
+### 25. 从裸机主循环改成三任务
+
+**为什么要改**：裸机主循环里"采集 → 测量 → 绘制"是串行的。一次整屏重画要几十毫秒，
+这段时间 ADC 完全没人管；慢时基（1 kSa/s 时当时一帧 320 点 ≈ 320 ms；触发改成
+640 点后约 640 ms）+ 固定 60 ms 超时，还会整帧判超时。任务化后采集由独立任务按节拍驱动，**绘制再慢也抢不走采样窗口**。
+
+**任务划分**
+
+| 任务 | 优先级 | 栈 | 节拍 | 职责 |
+| :--- | :--- | :--- | :--- | :--- |
+| `acq` | 4 | 1.0 KB | 20 ms 起 | 采一帧（640 点）→ 触发搜索取窗口 → 两路测量 → 发布新帧 → 让出 1 tick |
+| `ui` | 3 | 2.5 KB | 10 ms | 读按键/编码器 → 改状态 → 取新帧 → 重绘（含标定状态机） |
+| `mon` | 1 | 0.5 KB | 500 ms | 堆余量与两个任务的栈高水位（LED 心跳在 1 ms 中断里） |
+
+**采集优先级必须高于界面**：LCD 是 SPI 阻塞发送，界面任务一跑就是几十毫秒。
+采集任务优先级更高，就能在 DMA 完成中断给出信号量的瞬间抢占界面，
+先把新帧发布出去、再让界面慢慢画。反过来（界面优先）采样率会退化成"看绘图速度"。
+
+**数据交接：只锁一帧，锁内不碰硬件**
+`Scope_Frame`（两路已标定 mV + 测量结果 + 采样率 + 序号）由互斥量保护：
+采集任务锁内只做两次 `memcpy`（各 1280 B）+ `seq++` 就立刻释放；
+界面任务锁内比较 `s_frame.seq != s_view.seq`，不同才拷到自己的 `s_view`。
+两侧都**不在锁内操作硬件**（不发 SPI、不启停 DMA），临界区只有几微秒；
+互斥量带优先级继承，不会优先级反转。
+`s_st`（档位、运行状态）只由界面任务写、采集任务读，全是 8/32 位对齐标量，
+单次读写天然原子，**不加锁**——加了反而会把几十毫秒的绘制拖进采集路径。
+
+**踩的坑**：把 `App_Scope_Loop()` 拆成 `App_Scope_AcqStep()` / `App_Scope_UiStep()`
+之后，`main.c` 的 `while(1)` 里还留着旧调用：
+
+```
+main.c:158:5: error: implicit declaration of function 'App_Scope_Loop'
+              [-Wimplicit-function-declaration]
+```
+
+删掉即可。教训：**改公共 API 先全工程搜旧符号**；C99 下隐式声明是错误而不是警告，
+编译器等于已经把"这里有个不存在的函数"喊出来了。
+
+**验证方法（不靠肉眼）**
+
+1. **符号必到**：`nm` 里要有 `App_AcqTask`/`App_UiTask`/`App_MonitorTask`、
+   `xTaskDelayUntil`、`prvIdleTask`、`ucHeap`（32 KB），且**无未定义符号**。
+2. **中断向量必须归 FreeRTOS**：读 `.isr_vector` 的 0x2C / 0x38 / 0x3C 三项，
+   应分别指向 `SVC_Handler` / `PendSV_Handler` / `SysTick_Handler`
+   （本次为 0x08006b00 / 0x08006d80 / 0x08006de8）。
+   调度器一启动 SysTick 就是内核心跳——**这一项不对，整个 RTOS 都是死的**。
+   `.map` 里 `CubeMX_Unused_SVC_Handler` 被 `--gc-sections` 回收，
+   说明 `CMakeLists.txt` 的符号改名仍在生效。
+3. **栈够用**：看 `.su` 文件，Top 是 `Measure_Analyze` 288 B、`ParamBar_Draw` 128 B、
+   `Frontend_RawToMv` 104 B；1 KB 采集栈与 2.5 KB 界面栈都有数倍余量，
+   运行期再用 `uxTaskGetStackHighWaterMark()` 复核。
+4. **任务里没有阻塞延时**：全工程搜 `HAL_Delay`，只应剩 `ADC_Drv_DelayMs()` 的裸机分支
+   与 `Lcd_Init()` 的复位序列（只在调度器启动前跑一次）。
+
+**稳定性措施的落点**：`configCHECK_FOR_STACK_OVERFLOW = 2` →
+`vApplicationStackOverflowHook()`；`configUSE_MALLOC_FAILED_HOOK = 1` →
+`vApplicationMallocFailedHook()`。两个钩子都在 `Core/Src/freertos_hooks.c`，
+做"关中断 + 记录现场 + 停机"，不会带着坏状态继续跑。
+
+**实测资源**（迁移并加上"采集/刷屏互斥"后）：RAM 52 008 B (39.68 %)、FLASH 52 532 B (5.01 %)；
+其中 `ucHeap` 32 KB，三个任务实占约 6.5 KB（1.0 + 2.5 + 0.5 KB 栈 + TCB）。
+
+> 10 月 22 日加入触发、调度修复与逐通道标定后为 **RAM 56 088 B / FLASH 64 120 B**（见第十五节）。
+
+---
+
+### 26. RUN 之后 LED 闪烁忽快忽慢
+
+**现象**：烧录后不按运行键时，LED 以稳定的约 1 Hz 闪烁；一按 KEY4 开始采集，
+闪烁立刻变得极不规律——有时好几秒不动，有时连着抖好几下。
+
+**根因：任务饥饿**
+1. LED 心跳原本由监控任务 `mon`（优先级 1，最低）每 500 ms 翻转一次；
+2. 界面任务 `ui`（优先级 3）每次迭代画一帧，`App_Scope_UiStep()` 里的
+   `HAL_SPI_Transmit()` 是**忙等轮询**，不会主动让出 CPU，一帧就要几十毫秒；
+3. 而 `vTaskDelayUntil(&last, 10 ms)` 的周期只有 10 ms，早就被超期，于是它
+   **每个迭代都立刻返回**——界面任务实际上退化成一个"永不阻塞的纯计算循环"；
+4. 更低优先级的 `mon` 和空闲任务几乎拿不到 CPU，只能趁界面任务被采集任务
+   抢占时蹭到一点，于是 `mon` 的节拍被拉长、又成批追赶，LED 就忽快忽慢。
+
+**为什么 HOLD 时反而正常**：不采集时界面没有新帧要画，`App_Scope_UiStep()`
+很快返回，`vTaskDelayUntil` 能真正等满 10 ms，`mon` 按时执行，闪烁自然稳定。
+
+**解决（双管齐下）**
+1. **把心跳搬进硬件中断**：新增 `LED_Tick()`，由 TIM7 的 1 ms
+   中断调用（与 `Key_Tick()` 同一个回调）。函数里只有寄存器写和一个静态计数，
+   不阻塞、不受任务调度影响，节奏恒定。
+   （中途为了贴合"运行指示"曾改成"HOLD 闪、RUN 常亮"，后来按需求恢复为
+   **一直每 500 ms 翻转**——关键从来不是亮/闪的语义，而是**节奏由谁驱动**。）
+2. **界面任务主动让出 CPU**：每次迭代末尾 `vTaskDelay(1)`，只损失约 3% 的绘制时间，
+   换来 `mon` 与空闲任务按时执行（`g_monHeapFree`、栈高水位不再长期不刷新）。
+
+**验证（反汇编）**
+
+```
+80074e0: bl  Key_Tick
+80074e4: bl  LED_Tick
+```
+
+`LED_Tick` 内部没有依赖运行状态的分支：`count++` → `cmp #500` → 不足则直接返回，
+否则计数清零并 `bl LED_Turn`。
+
+**经验**
+- **低优先级任务被饿死，症状通常先出现在"它负责的那点小输出"上**（LED、日志、
+  统计值），而不是明显的卡死。这类输出一旦不稳定，先怀疑调度而不是硬件。
+- **`vTaskDelayUntil` 救不了超期的循环**：周期比执行时间短时它等价于 `while(1)`，
+  必须有别的让出点（延时、等信号量，或给低优先级任务留出时间片）。
+- **心跳/看门狗类的指示不要放在可能被饿死的任务里**，交给硬件定时中断最可靠。
+
+---
+
+### 27. HOLD 后按 KEY1 切通道，参数栏仍是原通道的数据
+
+**现象**：按 KEY4 暂停后，两条波形都冻结在最后一帧（这部分是对的）；但下方参数栏的
+`F / T / Vpp / RMS / DC` 只显示"暂停那一刻所测通道"的数值，按 KEY1 切到另一通道也不变。
+运行（RUN）时切换通道则完全正常。
+
+**根因**：交接帧里只有**一份**测量结果。`App_Scope_AcqStep()` 按当时的
+`s_st.measure_ch` 只测一路：
+
+```c
+Measure_Analyze((ch == 1U) ? s_mv1 : s_mv2, APP_CAP_LEN, sps, &meas);
+```
+
+所以帧里那份结果从生成起就绑定了"采集瞬间选中的通道"。KEY1 只改了**显示选择**，
+没有另一路的数据可换；HOLD 时没有新帧进来，这个错位就固定显形了。
+（RUN 时下一帧立刻按新通道重测，看不出问题。）
+
+**解决**：让每一帧**同时带上两路的测量结果**。
+
+1. `Scope_Frame` 的 `Measure_Result meas;` → `Measure_Result meas[2];  /* [0]=CH1, [1]=CH2 */`
+2. `App_Scope_AcqStep()` 每帧测两次（顺序调用，栈峰值不变）：
+   ```c
+   Measure_Analyze(s_mv1, APP_CAP_LEN, sps, &meas[0]);
+   Measure_Analyze(s_mv2, APP_CAP_LEN, sps, &meas[1]);
+   ```
+3. `App_DrawBars()` 按当前通道取指针：
+   ```c
+   const Measure_Result *m = &s_view.meas[(s_st.measure_ch == 1U) ? 0U : 1U];
+   ```
+4. `App_PublishFrame()` / `App_PullFrame()` 跟着拷两个元素。
+
+**代价**：每帧多一次 `Measure_Analyze()`（320 点整数运算，栈 288 B），
+实测 RAM 51 952 → 52 000 B、FLASH 52 396 → 52 400 B，帧率无可测变化。
+
+**经验**
+- **"显示的数据"和"显示的选择"必须是两份独立的东西**：只要数据是"按当时的选中项
+  算出来的"，一旦停止刷新（HOLD / 冻结 / 回放），切换选择就必然指向旧数据。
+  把多路结果一起带上，显示层只负责选指针，任何时刻切换都自洽。
+- 这类 bug 在 RUN 下会被下一帧自动掩盖，**只有冻结状态才暴露**——所以"暂停/回放/冻结"
+  类功能必须单独测一遍交互，不能只测运行态。
+
+### 28. 上 FreeRTOS 后波形噪声明显变大（裸机版很干净）
+
+**现象**：同一套前端、同样的采样率、同一块板子。裸机版本测量时波形非常干净；
+改成三任务调度后，两条波形都出现明显噪声（幅度抖动、毛刺）。第一反应是怀疑 LED 或 RTOS。
+
+**先排除了两个嫌疑**
+
+- **不是 LED**：LED 心跳是 **1 Hz** 方波（每 500 ms 翻转一次）。它造成的干扰只可能是
+  "每 500 ms 出现一个台阶"，不可能是一条连续的噪声带。把 `LED_Tick()` 那行临时注释掉
+  再烧一次，噪声一点没变——证伪。
+- **不是"RTOS 本身"**：中断响应、上下文切换的开销都在微秒量级，不改变任何模拟量。
+  RTOS 不会"凭空产生噪声"。
+
+**真正变的是"采样与刷屏的时间关系"**
+
+| | 裸机版 | RTOS 版 |
+|---|---|---|
+| 采集 320 点（40 kSa/s，当时；触发后为 640 点 = 16 ms） | 8 ms | `acq` 任务每 20 ms 启一帧 |
+| 刷屏 | 采完之后才开始画（约 117 ms） | `ui` 任务同时在画（30 ~ 50 ms） |
+| 两者关系 | **永不重叠** | **必然重叠** |
+
+关键在于：**DMA 搬运和 SPI 发送都是硬件外设自己跑的**，跟"哪个任务占着 CPU"没有关系。
+只要两者在时间上重叠，整屏 SPI 突发（121 ~ 154 KB，10.5 Mbit/s，约 117 ms）就会在
+3.3 V 与地上打出电流尖峰；而前端偏置网络是 **500 Ω 戴维南内阻直连 3.3 V**，
+尖峰正好从这里灌进 ADC 节点。采样窗口只有 3 cycles ≈ 143 ns，落在尖峰上就被采进去。
+裸机版天然无害，纯粹因为它**先采完再画**，两件事从不重叠。
+
+**解决：一把"总线互斥量"**
+
+`User/App/Src/App_Scope.c` 加 `static SemaphoreHandle_t s_bus_lock;`，把"采集"和"刷屏"
+互斥开（`APP_SERIALIZE_ACQ_DRAW` 置 0 可退回并行状态做对比）：
+
+- `App_Scope_AcqStep()`：`App_BusLock() → App_Capture() → App_BusUnlock()`
+- `App_Scope_UiStep()`：菜单绘制块、主界面绘制块**各自整体**包进 `App_BusLock()/App_BusUnlock()`
+
+反汇编确认两个步进函数都正确包住：
+
+```
+App_Scope_AcqStep: bl App_BusLock / bl App_Capture / bl App_BusUnlock / bl App_PublishFrame
+App_Scope_UiStep : bl App_BusLock / bl App_DrawWave / bl App_DrawBars / bl App_DrawMenu / bl App_BusUnlock
+```
+
+互斥量带优先级继承（采集优先级 4、界面 3），不会出现优先级反转。
+
+**实测**：改完直接烧录（没动硬件），双通道波形都恢复稳定。
+噪声根因确认就是"采集与刷屏并行"，与 LED、与 RTOS 调度本身都无关。
+
+**代价（用帧率换信噪比）**
+
+慢时基下界面要等一次采集：1 kSa/s 时当时一帧 320 ms、刷新降到约 3 fps（触发把采集
+改成 640 点后约 640 ms、约 1.5 fps；原来约 26 ~ 43 fps）。
+快时基（≤ 100 kSa/s）几乎无感，因为采集本来就比绘制短得多。
+对示波器来说这笔交易是划算的——**画面漂亮但数据是脏的，不如画面慢一点但数据可信**。
+
+**附带：怎么量化确认**
+
+`User/App/Src/ADC_NoiseTest.c` 是个临时诊断（`Core/Src/main.c` 里
+`#define APP_RUN_NOISETEST` 置 1 启用），做 A/B 两组对照：
+
+- **A 组**：只采集、不绘制；
+- **B 组**：采集过程中调用 `View_DrawFrame()` 整屏重画，制造并行。
+
+两组各跑 6 轮，各 320 点，打印两路的 `spread avg / max`（码值与 mV）。
+判读口径：
+
+- **B 明显大于 A** → 刷屏耦合，正是本文这个根因；
+- **A 本身就很大** → 与 LCD 无关，问题在前端电路 / 地 / 供电；
+- **A、B 都小** → 你看到的"噪声"其实是无触发导致的相位游走，那是"抖"不是"噪"。
+
+**经验**
+
+- **上 RTOS 后要重新审视"硬件时序"，不能只看 CPU 归属**。任务优先级保证的是
+  "谁用 CPU"，保证不了"两个外设不同时工作"——DMA、SPI、ADC 都是自动跑的，
+  必须显式加锁或有意识地串行化。
+- **"之前好好的，加了 X 就坏了"，一定要把 X 拆开看**。这次 X 里真正起作用的是
+  "并行"，而不是 LED、也不是 RTOS 本身。先做能**证伪**的对照实验（注释 LED、
+  置 0 开关），比凭直觉改代码快得多。
+- **这类问题的典型特征是"只有加了并行机制才出现"**：裸机工程师习惯的"先采后画"
+  本身就是一种隐式互斥，一旦拆成任务，这层保护就没了。
+- **还有一条待办（已实现）**：之前没有触发，每帧起始相位随机，周期信号在屏幕上会缓慢游走。
+  这是"抖"而不是"噪"，噪声修好之后单独立项，现已实现（见第十二节）。
+
+---
+
+## 十二、边沿触发 + 预触发（10 月 21 日）
+
+### 29. 波形一直左右抖动，周期信号不"钉"屏
+
+**现象**
+
+问题 28 的噪声修好后，波形干净了，但仍在**左右缓慢游走**。周期信号（如 1 kHz 正弦）
+每一帧的起始相位都不同，屏幕上看起来"抖"，读周期/相位根本没法读。
+这不是噪声——噪声是线变粗，抖动是整条线在水平方向平移。
+
+**根因**：自由采样。每帧从任意时刻开始采一整窗（当时 320 点，后改成 640 点带预/后触发），
+帧与帧之间没有共同的"时间零点"，所以周期信号在屏幕上的横向位置每帧都不同。
+
+**方案：中心触发 + 半屏预触发**
+
+| 参数 | 取值 | 理由 |
+| :--- | :--- | :--- |
+| 实际采集 | **640 点** = 320 显示 + 160 预触发 + 160 触发后 | 触发点放屏幕正中，两侧都有波形 |
+| 搜索窗口 | `k ∈ [160, 479]` | 保证 `k−160 ≥ 0` 且 `k+160 ≤ 639`，显示窗完整落在采集缓冲内 |
+| 迟滞 | `V/div ÷ 20`（至少 1 mV） | 单阈值时噪声在电平附近反复穿越，触发点每帧跳一个采样点；滞回把"抖"压到 ≤1 px |
+| 触发电平步进 | `V/div ÷ 10` | 每个大格分 10 步，手感与 V/div 档位一致 |
+| 电平范围 | ±5 格 | 再远就永远碰不到波形，标记只会贴在边框上 |
+| 捕获超时 | `640×1000/sps + 100 ms`（上限 1500） | 慢时基 1 kSa/s 时一帧 640 ms，固定超时会每帧误判 |
+
+**关键代码**
+
+- `User/Algorithm/Src/Trigger.c`：`Trigger_Find()` 纯整数，扫描第一个满足
+  `mv[k] ≤ 电平−迟滞 && mv[k+1] ≥ 电平+迟滞`（上升沿）的采样区间，返回
+  `Trigger_Point { index, frac_q16 }`——`index` 是穿越前一刻的下标，`frac_q16`
+  是穿越时刻在 `index..index+1` 之间的 Q16 位置。没找到返回 `index = -1`。
+  下降沿反向。无 HAL/FreeRTOS 依赖。
+- `User/App/Src/App_Scope.c`：
+  `App_Capture()` 采 640 点 → 逐点 `Frontend_RawToMv()` → 按触发源选通道 →
+  `Trigger_Find()` → `App_ResampleWindow()` 用 `frac_q16` 对两路做就地线性插值，
+  把显示窗对齐到真实穿越时刻（`win_start = 0`）；没找到时 `win_start = 160`、
+  退回自由滚动。`App_PublishFrame()` 只发布这一窗 320 点，界面层完全不知道
+  触发搜索的存在。测量也改用这一窗（`Measure_Analyze(&s_mv1[win_start], ...)`），
+  测量结果与屏幕上的波形严格对应。
+
+**没触发怎么办：回退，不冻结**
+
+找不到穿越点时**不冻屏**，而是照常显示中间 320 点（自由滚动），并把电平线画成**红色虚线**；
+锁定成功时画**灰色虚线**。这样"没触发"在屏幕上是可见的，而不是一个需要猜的黑盒。
+代价是红色虚线的存在让"锁定指示"只能靠颜色——但状态栏 240 px 宽已被
+`CH / RATE / TIME / MODE / RUN / LIMIT` 占满，加文字必然挤掉现有信息，颜色是零成本方案。
+
+**资源占用（Debug 构建实测）**
+
+| 指标 | 触发功能加入前 | 加入后 |
+| :--- | ---: | ---: |
+| FLASH | 52 532 B（5.01 %） | **55 048 B（5.25 %）** |
+| RAM | 52 008 B（39.68 %） | **55 864 B（42.62 %）** |
+
+RAM 增量约 3.8 KB 来自 640 点缓冲：`s_raw[640]`（4 B/点）+ `s_mv1[640]` + `s_mv2[640]`，
+比原来的 320 点版本正好翻倍。CCMRAM 仍为 0——DMA 缓冲区必须在 SRAM。
+亚采样插值（`Trigger_Point` + `App_ResampleWindow()`）另加约 0.6 KB FLASH；
+AUTO 电平（`App_AutoLevel()`）再 +0.2 KB，触发功能最终为 55 048 B（5.25 %）。
+之后调度修复（问题 32）+256 B、逐通道标定（问题 33，含 HAL flash 驱动）+约 8.8 KB，
+**当前为 FLASH 64 120 B（6.11 %）/ RAM 56 088 B（42.79 %）**，完整增量表见 §15.9。
+
+**代价**
+
+- 一帧采集时长翻倍（`640/sps`）：1 kSa/s 时约 640 ms/帧，慢时基下界面响应变慢。
+  这是拿响应速度换波形稳定，与问题 28 的"用帧率换信噪比"是同一类取舍。
+- 触发搜索本身 O(320) 次整数比较，加上亚采样重采样（2×320 次插值），相对 DMA 等待可忽略。
+
+**验证状态（重要）**
+
+- 已通过 `arm-none-eabi-gcc`（`-Wall -O0 -g3`）完整构建，**零警告**，链接产物
+  `.elf`/`.map` 正常，内存占用如上表。
+- **尚未实机验证**：本次改动只做了编译与代码审查，没有烧录到板子上。
+  上板后建议优先确认四件事：
+  1. 默认（CH1、上升沿、0 mV 电平）下 1 kHz 正弦是否稳定锁定（灰色虚线、波形不动）；
+  2. 触发电平扫到波形范围外时，是否退化为红色虚线 + 自由滚动（不黑屏、不冻屏）；
+  3. 菜单 6 行弹窗（220×150，当时为 5 行 220×130）是否把波形区盖得过多、退出后是否整片重画干净；
+  4. 慢时基（100 ms/div、1 kSa/s）下按键是否明显变迟钝（预期约 640 ms 一次）。
+
+**经验**
+
+- **"抖"和"噪"要分开诊断**：噪是线变粗（垂直方向随机），抖是整条线平移（水平方向随机）。
+  前者查采样环境（问题 28），后者查时间基准（本节）。
+- **触发功能必须让"锁定状态"可见**。示波器用户看到波形动，第一反应是"信号有问题"；
+  如果软件不告诉他"这帧没触发"，他会一直调电平却不知道为什么没用。
+- **回退路径比成功路径更重要**：触发失败时如果冻屏或黑屏，用户会以为程序死了。
+  回退到自由滚动 + 视觉提示，是"失败也要可用"。
+
+### 30. 打开触发后刷新率掉回 8 fps 量级
+
+**现象**
+
+触发功能加上之后，波形确实"钉"住了，但屏幕刷新明显变慢，接近问题 22 那个
+整屏重画时代的水平（约 8~10 fps）。
+
+**根因：触发点只对齐到了采样网格**
+
+`Trigger_Find()` 一开始找到的是"第一个越过电平的采样点 k"。而真实的穿越时刻
+落在采样点 `k−1` 与 `k` 之间，这个亚采样偏移（相对一个采样周期的比例）由
+采样时钟与信号频率的相位差决定，**每帧都不一样**。于是显示窗的起点每帧平移
+不到一个采样点，屏幕上的波形就横向抖动 ±1 像素。
+
+对增量刷新来说这是致命的：行指纹（FNV-1a）是对整行 320 个像素算的，
+一像素的横向平移会让曲线穿过的**每一行**像素值都变化，指纹全部不匹配，
+于是每帧把整条波形重推一遍（72 行 ≈ 46 KB、满屏 190 行 ≈ 122 KB），
+再加上参数栏 17.9 KB 和 16 ms 采集，单帧回到 50~110 ms。
+
+**方案：亚采样插值 + 重采样**
+
+1. `Trigger_Find()` 改为返回 `Trigger_Point { index, frac_q16 }`：
+   `frac_q16 = (level − mv[index]) / (mv[index+1] − mv[index]) × 65536`（Q16 定点，
+   用 int64 中间运算避免小信号时溢出）。
+2. `App_ResampleWindow()` 把 320 点显示窗按 `frac_q16` 线性插值重采样：
+   输出第 i 点 = `buf[index−160+i] + (buf[index−159+i] − buf[index−160+i]) × frac`，
+   于是第 160 点恰好落在真实穿越时刻（屏幕中线）。
+3. 帧与帧之间只剩 ADC 噪声差异，行指纹绝大多数命中，刷新率恢复到正常水平；
+   顺带触发精度从"一个采样周期"提高到亚采样，波形真正钉死。
+
+**代价与边界**
+
+- 每帧多做 2×320 次 int64 乘除（约 0.2~0.4 ms @168 MHz），相对 DMA 等待可忽略。
+- 没触发（红虚线）时不做插值，仍是自由滚动，刷新率与旧版一致。
+- 插值假设相邻两点之间是直线：信号频率远低于采样率时足够好；
+  1 kSa/s 慢时基下信号本身变化缓慢，插值误差远小于 1 像素。
+
+**验证状态**：只做了编译 + 代码审查，**未上板**。上板重点看：锁定后电平线
+为灰色时波形是否完全静止；红虚线时是否照常滚动；40 kSa/s 下帧率是否回到
+20 fps 以上。
+
+### 31. 单极性 PWM / 逻辑信号怎么都"钉"不住
+
+**现象**
+
+把探头接到 F103 输出的 3.3 V PWM 上，能看到方波，但波形一直自由滚动、中间是
+未触发颜色的虚线（本应是红色；本机面板 R/B 顺序不同，实际显示偏青/偏蓝）。
+在菜单里把 `Trig level` 从 0 mV 往上调，调进 0~3.3 V 之间才会锁定，调回 0 mV 又失效。
+
+**根因：默认触发电平落在单极性信号的幅度之外**
+
+`App_Scope_Init()` 把 `trig_level_mv` 初始化为 0。上升沿的判定条件是
+"前一个采样点 ≤ 电平−迟滞，后一个采样点 ≥ 电平+迟滞"。单极性 PWM 最低就是 0 V
+（逻辑 0），永远不会低于 `0 − 迟滞`，所以每个 640 点窗口都找不到触发点，
+`state` 一直是 `APP_TRIG_STATE_MISSING`，画面退回自由滚动。
+
+这不是 bug，而是"默认值只对双极性/带负偏置信号友好"的设计缺口：正弦波接上时
+信号通常自然跨 0；PWM 却不跨 0。
+
+**方案：AUTO 电平（信号中点重试）**
+
+1. `App_AutoLevel()`（`User/App/Src/App_Scope.c`）扫一遍整段 640 点，取
+   `(最小值 + 最大值) / 2` 作为候选电平；对 0…3.3 V PWM 就是约 1.65 V。
+2. `App_Capture()` 先用菜单里的电平找触发点；找不到时用 AUTO 电平再找一次，
+   命中则把该电平写回 `s_st.trig_level_mv`——菜单数值、屏幕电平线一起跟过去。
+3. 仍然找不到（纯直流、边沿方向反了、幅度小于迟滞带）才回退自由滚动。
+
+**代价与边界**
+
+- 每帧多一次 640 点扫描（2 次比较/点），只在"按设定电平没找到"时发生，
+  正常锁定时零开销。
+- AUTO 只解决"电平不在幅度内"这一类失败；`Trig edge` 选反、`Trig src` 选错、
+  幅度低于迟滞带仍会保持未触发。
+- 纯直流信号没有穿越点，AUTO 取到的中点是直流值，仍然找不到穿越点，照常自由滚动。
+- 中点对方波/三角波足够好；占空比很极端或带过冲的信号仍可手动微调电平。
+
+**验证状态**
+
+编译通过（`-Wall` 零警告）。上板重点看：3.3 V PWM 默认设置下是否直接锁定（灰线）；
+把 `Trig level` 挪到幅度外后是否自动跟回中点；纯直流输入是否仍自由滚动。
+
+**经验**
+
+- **默认值要覆盖"最常见的错误接法"**：用户接上就期待稳定波形，默认 0 mV 对
+  有偏置的信号合理，对单极性信号是陷阱；AUTO 在不增加菜单复杂度的前提下兜底。
+- **自动行为必须可见**：AUTO 写回菜单值，用户能看到"电平自己变了"，否则会
+  怀疑是 bug。文档里单独列一条 FAQ。
+- **颜色问题要单独解释**：本机面板 R/B 反序，红色虚线实际偏青/偏蓝（见
+  `LCD_UI_DESIGN.md`），判断只看"灰 = 锁定，非灰 = 未触发"。
+
+---
+
+## 十三、任务调度与总线锁（10 月 21 日）
+
+### 32. 按 KEY4 开始采集后，按键/编码器要十几秒才响应一次
+
+**现象**
+
+上电停在 HOLD 时按键、编码器都正常；一按 KEY4 开始采集，按键和编码器要过十几秒
+才响应一次，几乎没法操作。慢时基（1 kSa/s）时更明显。
+
+**根因：互斥量 give 只唤醒、不转移所有权，高优先级采集任务把锁"截胡"**
+
+界面任务和采集任务通过 `s_bus_lock` 互斥（问题 28 的采样/刷屏串行化）。采集任务
+优先级是 `tskIDLE_PRIORITY+4`，界面任务只有 `+3`。FreeRTOS 的 `xSemaphoreGive()`
+在互斥量上**只把等待者从阻塞态变成就绪态**，并不把所有权交给它；当前更高优先级的
+采集任务会继续运行，在下一轮 `App_Scope_AcqStep()` 开头 `App_BusLock()` 时立刻
+把计数=1 的锁重新取走。界面任务醒来再取时计数已是 0，只好继续等——只有采集任务
+**真正阻塞**（`vTaskDelayUntil` 进入等待）时，界面才能抢到锁。
+
+触发功能把采集从 320 点改成 640 点后，一帧 = 16 ms 采集 + 1280 次 `Frontend_RawToMv`
+换算 + 触发查找/重采样 + 两路测量 + 发布 ≈ 20 ms 以上，正好吃掉 20 ms 的周期：
+`vTaskDelayUntil` 几乎每帧立即返回，采集任务不让出 CPU，界面任务被长期饿死。
+按键/编码器只在 `App_Scope_UiStep()` 开头读，于是要隔十几秒才被处理一次。
+
+**方案：采集每帧让出 1 tick + 界面取锁有上限**
+
+1. `User/App/Src/App_Rtos.c` 的 acq 循环：`App_Scope_AcqStep()` 返回非 0 后
+   `vTaskDelay(1U)` 显式让出 1 个 tick，保证界面任务每帧都有机会拿到锁。
+2. `User/App/Src/App_Scope.c`：新增 `App_BusLockWait(timeout)`，界面任务取锁改为
+   最多等 `APP_UI_BUS_WAIT_MS`（20 ms）；新增 `s_draw_pending` 与 `App_UiDrawFrame()`，
+   拿不到锁就保留"欠一帧"状态、下一轮再画，不再用 `portMAX_DELAY` 死等。
+3. 绘制仍全程持锁，问题 28 的"采样期间不刷屏"约束不变。
+
+**代价与边界**
+
+- 每帧多 1 ms 让出（40 kSa/s 下约 5 %）；采集节拍由 16~20 ms 变成 17~21 ms，可接受。
+- 界面最多等 20 ms；慢时基（1 kSa/s 一帧 640 ms）下界面会"少画几帧"，但按键/编码器
+  每轮都先扫描，不会被 640 ms 的采集拖住。
+- 这只解决"界面拿不到锁"的饿死；若界面自身绘制超过 20 ms，表现为掉帧而不是卡输入。
+
+**验证状态**
+
+编译通过（`EXIT=0`、`-Wall` 零警告），当时 FLASH **55 304 B / 1 MB（5.27 %）**、
+RAM **55 864 B / 128 KB（42.62 %）**，CCMRAM 0（当前 64 120 B / 56 088 B，见第十五节）。**未上板**，上板重点看：
+上电按 KEY4 后立刻转编码器/按键是否马上响应；HOLD/RUN 反复切换是否跟手；
+慢时基下按键是否仍不卡。
+
+**经验**
+
+- **FreeRTOS 的 give 不是 handoff**：唤醒等待者 ≠ 把锁交给它。高优先级任务若在
+  give 后不阻塞，就会把锁再抢回去；低优先级等待者只有在高优先级任务真正阻塞时
+  才能拿到锁。要么让高优先级任务每轮真正延时（本次做法），要么用队列/任务通知
+  显式传递"该谁画"。
+- **界面任务对总线锁的等待必须有上限**，并且"欠帧"要作为显式状态保留，否则跳过
+  一帧就等于丢一帧、按键也可能跟着丢。
+- **任务周期要留余量**：一帧处理时间逼近任务周期时，`vTaskDelayUntil` 不再提供
+  任何让出，必须显式 `vTaskDelay(1)`。这与问题 26 是同一类调度饿死，只是这次
+  饿死发生在总线锁上。
+
+---
+
+## 十四、逐通道标定（10 月 21 日）
+
+### 33. CH1 和 CH2 读数不一致，而且只有 CH1 标定过
+
+**现象**
+
+同一路信号分别接 CH1、CH2，参数栏读数差几十 mV 到上百 mV；之前只在自检里实测过
+CH1 的 GND 零点（`Frontend.h` 注释里写着 1941 / 1320），CH2 从来没标过。
+而且原来的标定表只按**量程**分（S/W 两套），两个通道共用同一套参数，就算想标 CH2
+也没有地方存。
+
+**根因：标定粒度不够 + 没有设备端入口**
+
+`Frontend.c` 的 `k_frontend_cal[2]` 下标只有量程，`Frontend_RawToMv(raw)` 也不带
+通道参数；`App_Scope.c` 换算两路时调用的是同一个函数，所以 CH2 一直借用 CH1 的
+零点/增益。两颗通道的偏置分压（两个 1 kΩ）和输入端 RC 都有公差，几十 mV 的差异是
+正常现象，必须逐路标定。
+
+**方案：每通道 × 每量程一套参数 + 设备端两点标定 + flash 保存**
+
+1. `Frontend` 改为 `[通道][量程]` 四套参数：`Frontend_RawToMv(ch, raw)`，访问器全部
+   带 `channel`；`Frontend_Init()` 上电从 flash 读回，缺失/校验失败用设计默认值。
+2. 两点法直接测：接 GND 记 `zero_raw`，接板载 3.3 V 记 `span_raw`，由
+   `(span_raw − zero_raw)` 反推比例（等价 `gain_num = 4095`、`gain_den = 码值差`），
+   电阻公差、1.65 V 分压偏差、ADC 增益误差一起吸收。
+3. 菜单加第 6 行 `Cal`：KEY1 切换要标定的通道（**对应用户要求的"KEY1 选哪个通道就
+   标哪个通道"**），KEY4 依次采 GND / 3.3 V，KEY2 取消；标定期间暂停采集并持总线锁，
+   提示画在波形区中央。
+4. 结果写 **flash 扇区 11（`0x080E0000`，最后 128 KB）**，代码约 64 KB，互不影响；
+   上电读回。烧写时选整片擦除会清掉标定，重新标一次即可。
+5. 防错：码值差必须落在本量程的设计区间（大量程 125–270 码、小量程 950–1900 码），
+   否则拒绝标定并提示 `CAL FAIL: 3V3/RANGE?`——这样"跳线乙位置与 V/div 档位错配"
+   不会被固化成错误的标定值（呼应问题 23 的量程/跳线问题）。
+
+**代价与边界**
+
+- 新增 flash 驱动调用与标定代码：FLASH 从 55 304 B 涨到 **64 120 B / 1 MB（6.11 %）**；
+  RAM 从 55 864 B 涨到 **56 088 B / 128 KB（42.79 %）**，CCMRAM 0。
+- 擦除扇区 11 约 1–2 s，期间 CPU 取指停顿、屏幕停在 `CAL SAVING...`，属正常现象。
+- 3.3 V 满点用板载 3.3 V 轨（同时是 ADC 基准），绝对精度以这条轨为准；要更准可用
+  万用表量出轨电压再换算。
+- 标定粒度是"当前通道 + 当前量程"：换量程（S↔W）后要分别标，因为两种量程的偏置
+  增益不同。
+
+**验证状态**
+
+编译通过（`EXIT=0`、`-Wall` 零警告）。**未上板**，上板重点看：CH1、CH2 分别接
+GND 按一次 KEY4、接 3.3 V 按一次 KEY4 后，两路读同一信号是否一致；断电重上电后
+标定值是否还在（说明 flash 保存生效）；故意把跳线插错量程时是否报
+`CAL FAIL: 3V3/RANGE?`；按 KEY1 切到 CH2 后 CH2 是否也被钉住（波形不再左右滚动、
+触发电平虚线变灰）。
+
+**经验**
+
+- **标定的最小粒度是"物理通道 × 量程"**：共用一个系数只能保证"名义一致"，两路
+  分压电阻和 RC 的公差会直接变成读数差。
+- **两点法比"算模型 + 测零点"稳**：模型里的 1.65 V、500 Ω 都是标称值，两点直接
+  消掉所有比例误差；3.3 V 轨当基准虽然不绝对准，但自洽（读自己的轨就是 3.300 V）。
+- **把"防错"写进标定**：用码值差区间判断量程/跳线是否匹配，比事后查"为什么读数是
+  4 倍"省事得多。
+
+**补充（10 月 22 日）：KEY1 现在同时切触发源**
+
+上板反馈"按 KEY1 切到 CH2 后，仍然只有 CH1 的波形被钉住"。这不是标定没生效，而是
+**触发源没有跟着 KEY1 走**：触发搜索用的是 `s_st.trig_src`（默认 CH1），而 KEY1 原来
+只改参数栏的测量通道（`s_st.measure_ch`），所以 CH1 被钉住、CH2 自由滚动。现在主界面
+KEY1、菜单 `Cal` 行的 KEY1、标定流程里的 KEY1 都会同步 `s_st.trig_src`，做到"KEY1 选
+哪一路，就测哪一路、钉哪一路"；菜单里的 `Trig src` 行仍可单独指定触发源（之后按 KEY1
+会重新同步）。
+
+---
+
+## 十五、10 月 21 日以来的软件实现方法（FreeRTOS / 触发 / 标定）
+
+第十一节到第十四节记的是"问题是怎么被发现、怎么定位的"；这一节按第六章的写法，
+把这段时间最终落地的**软件结构、关键算法和取值**记下来 —— 不写"踩了哪个坑"，
+而是写"为什么最后是这套结构"，方便以后改采集链路、加触发模式或换屏幕时照着改。
+
+### 15.1 文件分工与调用方向
+
+| 文件 | 职责 | 对外接口 |
+|---|---|---|
+| `User/App/Src/App_Rtos.c` | 三个任务的入口与循环、心跳/栈高水位统计 | `App_Rtos_Start()` |
+| `User/App/Src/App_Scope.c` | 示波器状态机：采集、触发、测量、发布、按键/编码器、菜单、标定 | `App_Scope_Init/AcqStep/UiStep()` |
+| `User/Algorithm/Src/Trigger.c` | 纯整数触发查找，返回亚采样位置 | `Trigger_Find()` |
+| `User/Algorithm/Src/Measure.c` | 纯整数测量：Vpp / RMS / 均值 / 频率 | `Measure_Analyze()` |
+| `User/App/Src/ScopeMenu.c` | 220×150 设置弹窗的绘制 | `ScopeMenu_Draw()` |
+| `User/View/Src/WaveView.c` | 波形区增量刷新、触发电平标记叠加 | `WaveView_DrawTrace/Invalidate/DrawMessage()` |
+| `User/BSP/Src/Frontend.c` | 逐通道标定表、raw→mV、flash 读写 | `Frontend_RawToMv/Calibrate/CalSave()` |
+| `User/BSP/Src/ADC_Drv.c` | TIM2 + 双 ADC + DMA 采集驱动 | `ADC_Drv_CaptureStart/Wait/Stop()` |
+
+调用方向是单向的：`App` 调 `Algorithm`/`View`/`BSP`；`View` 和 `Algorithm` 都不 include 任何 HAL 头。
+`Trigger.c` / `Measure.c` 只依赖 `<stdint.h>`，保持"可以拿到主机上单独测"的边界（本工程没有
+主机编译器，但结构上留了这条路）。
+
+### 15.2 任务划分与两把互斥量
+
+| 任务 | 优先级 | 栈 | 周期 | 干什么 |
+|---|---|---|---|---|
+| `App_AcqTask` | `tskIDLE_PRIORITY+4` | 1.0 KB（`configMINIMAL_STACK_SIZE*2`，最小栈 128 字） | 20 ms（下限） | 采一帧 → 换算 → 触发 → 测量 → 发布 |
+| `App_UiTask` | `+3` | 2.5 KB（`*5`） | 10 ms | 读编码器/按键 → 处理 → 拉帧 → 重绘（取锁最多等 20 ms） |
+| `App_MonitorTask` | `+1` | 0.5 KB（`*1`） | 500 ms | 心跳、剩余堆、两个任务栈高水位 |
+
+两个循环的关键写法：
+
+```c
+/* acq：采完一帧显式让出 1 tick */
+if (App_Scope_AcqStep() != 0U) {
+    vTaskDelay(1U);
+}
+vTaskDelayUntil(&last, pdMS_TO_TICKS(APP_ACQ_PERIOD_MS));   /* 20 ms */
+
+/* ui：10 ms 周期用不满，也让 1 tick 给 mon/idle */
+drew = App_Scope_UiStep();
+if (drew != 0U) {
+    g_monUiFrames++;
+}
+vTaskDelay(1U);
+vTaskDelayUntil(&last, pdMS_TO_TICKS(APP_UI_PERIOD_MS));     /* 10 ms */
+```
+
+两把互斥量分工不同：
+
+| 锁 | 保护什么 | 谁拿 | 持有多久 |
+|---|---|---|---|
+| `s_lock` | `s_frame` 与 `s_view` 之间的 2×1280 B 拷贝 + `seq` | acq 发布 / ui 拉取 | 微秒级 |
+| `s_bus_lock` | "ADC DMA 突发"与"LCD SPI 突发"不同时发生（问题 28 的噪声修复） | acq 采集段 / ui 绘制段 | 40 kSa/s 约 16 ms + 2 ms；慢时基可到几百 ms |
+
+**为什么 acq 每帧要 `vTaskDelay(1)`**：`xSemaphoreGive()` 只是把等待者从事件列表移到就绪列表，
+并不把所有权交给它。acq 优先级比 ui 高，give 之后如果它继续跑，下一轮 `App_BusLock()` 会立刻把
+计数=1 的锁重新拿走，ui 醒来再取就是 0 —— 这就是"按 KEY4 后按键/编码器十几秒才响应一次"的成因
+（问题 32）。让出 1 tick 后 ui 必定能在这一拍拿到锁画完；代价是每帧多 1 ms，40 kSa/s 下约 5 %。
+
+**为什么 ui 取锁要有上限**：慢时基一帧 640 ms，ui 不能死等，否则按键扫描也被拖住。
+`App_BusLockWait(APP_UI_BUS_WAIT_MS = 20)` 拿不到就返回 0，本帧不画，`s_draw_pending` 留着下一轮再试。
+
+**经验**
+- 互斥量的 give 不是 handoff：把它当"谁先醒谁拿"的计数器，不要当"交钥匙"。
+- 优先级只决定"就绪后谁先跑"，不决定"谁先拿锁"。
+- "要不要画"和"画成没有"要分开：`s_draw_pending` 只由 ui 任务读写，不需要再加锁。
+
+### 15.3 一帧采集的完整链路
+
+```
+TIM2 TRGO（sps）→ ADC1/ADC2 同步转换 → DMA2_Stream0 搬 640×32bit
+      ↓
+ADC_Drv_CaptureWait（NDTR==0 判完成）→ CaptureStop
+      ↓
+s_raw[640] → s_mv1[640] / s_mv2[640]（前端零点/增益，两路各一套标定）
+      ↓
+Trigger_Find（选中的那一路上找）→ index + frac_q16
+      ↓
+App_ResampleWindow（两路用同一 index/frac，就地插值成 320 点）
+      ↓
+Measure_Analyze（两路各 320 点）→ App_PublishFrame（seq++）
+      ↓
+App_PullFrame（ui）→ WaveView_DrawTrace（增量刷新）
+```
+
+核心几行：
+
+```c
+ADC_Drv_CaptureStart(s_raw, APP_CAP_RAW);                  /* 640 点，正常模式 DMA */
+if (ADC_Drv_CaptureWait(App_CaptureTimeoutMs(sps)) == ADC_DRV_OK) { /* ... */ }
+ADC_Drv_CaptureStop();
+for (i = 0U; i < APP_CAP_RAW; i++) {
+    s_mv1[i] = Frontend_RawToMv(FRONTEND_CH1, ADC_Drv_WordCh1(s_raw[i]));
+    s_mv2[i] = Frontend_RawToMv(FRONTEND_CH2, ADC_Drv_WordCh2(s_raw[i]));
+}
+```
+
+超时公式：`ms = (640 × 1000) / sps + 100`，上限 1500。
+
+| sps（时基） | 一帧长度 640/sps | `App_CaptureTimeoutMs` |
+|---|---|---|
+| 40 kSa/s（1 ms/div，默认） | 16 ms | 116 ms |
+| 200 kSa/s（200 µs/div） | 3.2 ms | 103 ms |
+| 1 kSa/s（50 ms/div 及以上） | 640 ms | 740 ms |
+
+`win_start` 决定发布哪一段 320 点：
+
+| 触发状态 | `win_start` | 含义 |
+|---|---|---|
+| `LOCKED`（找到触发点） | 0 | 重采样后的前 320 点，触发点在下标 160（屏幕中线） |
+| `MISSING`（没找到） | 160 | 原始缓存的中间 320 点，自由滚动 |
+| `OFF`（触发关闭） | 160 | 同上，不搜索、不画标记 |
+
+缓冲：`s_raw[640]`、`s_mv1[640]`、`s_mv2[640]` = 3 × 2560 B = 7.5 KB；从 320 点改到 640 点时
+RAM 正好多 3.75 KB。超时用的是 `APP_CAP_RAW`（640）而不是 320，否则慢时基下会"没采完就判超时"。
+
+**经验**
+- 一帧的长度由时基决定，不由任务周期决定：640/sps，40 kSa/s 是 16 ms，1 kSa/s 是 640 ms。
+  `vTaskDelayUntil` 的 20 ms 只是"最快多久一轮"。
+- 采集段整段持总线锁（Start → Wait → Stop → 换算 → 触发 → 插值），保证 DMA 突发与 LCD 突发不重叠；
+  `Measure_Analyze` 与发布在锁外做（此时缓存不会再被别人改）。
+- `seq` 同时是帧号和新帧标志，ui 只比较它，不为"有没有新帧"再设一个变量。
+
+### 15.4 触发搜索与亚采样对齐
+
+触发模块的接口只有四个类型/函数：
+
+```c
+typedef enum {
+    TRIGGER_EDGE_OFF = 0,
+    TRIGGER_EDGE_RISING = 1,
+    TRIGGER_EDGE_FALLING = 2
+} Trigger_Edge;
+
+typedef struct {
+    int32_t      level_mv;       /* 触发电平（mV，绝对值） */
+    int32_t      hysteresis_mv;  /* 迟滞半宽（mV） */
+    Trigger_Edge edge;
+    uint16_t     pre_samples;    /* 触发点前保留多少点 */
+    uint16_t     post_samples;   /* 触发点后保留多少点 */
+} Trigger_Config;
+
+typedef struct {
+    int32_t  index;     /* 穿越点前一刻的采样下标；-1 = 没找到 */
+    uint16_t frac_q16;  /* 穿越点在 index..index+1 之间的 Q16 位置 */
+} Trigger_Point;
+
+Trigger_Point Trigger_Find(const int32_t *mv, uint16_t count,
+                           const Trigger_Config *cfg);
+```
+
+**搜索区间**：`count = 640`、`pre = post = 160`，所以 `k ∈ [160, 479]`。
+`k` 是"穿越前一刻"，保证 `k ≥ 1`、`k+1 < count`，且显示窗口 `start = k − 160` 落在 `[0, 319]`。
+
+**判定条件**（迟滞带 `h`，上升沿）：
+
+```
+mv[k] <= level − h  且  mv[k+1] >= level + h
+```
+
+下降沿把不等号反过来。`h = V/div ÷ 20`，最小 1 mV：
+
+| V/div | 迟滞 h |
+|---|---|
+| 100 mV/div | 5 mV |
+| 500 mV/div | 25 mV |
+| 1 V/div | 50 mV |
+| 10 V/div | 500 mV |
+
+迟滞不是"滤波"，是**防重复触发**：信号在电平附近抖动时，若只判"穿过电平"，噪声会造出很多个
+候选穿越点，触发点在其中跳来跳去，屏幕反而更抖。加上"必须先从电平下方 h 以外进到上方 h 以外"
+之后，噪声不会造出额外的命中；`Trigger_Find` 取**第一个**命中的 `k`（周期信号就是显示窗里的
+第一个上升沿），后面的命中不再看。
+
+**亚采样位置**：只对齐到采样网格（`k`）时，真实穿越点落在 `k..k+1` 之间的随机位置，
+每帧差最多 1 个采样点；在屏幕上就是 ±1 像素的横向抖动。行指纹（15.5）只要有一列变了就整行失效，
+于是每帧退化成整屏重画（问题 30）。所以返回 Q16 的分数位置：
+
+```
+frac = (level − v0) × 65536 / (v1 − v0)      // clamp 到 [0, 65535]
+```
+
+上层把显示窗起点 `a = k − 160 + i` 处的两个相邻采样线性插值到"真实穿越时刻"：
+
+```c
+v0 = buf[a];
+v1 = buf[a + 1];
+buf[i] = v0 + (int32_t)(((int64_t)(v1 - v0) * frac_q16) / 65536);
+```
+
+`i = 160` 时输出值正好等于 `level` —— 触发点永远钉在屏幕中线。两路用**同一个** `index/frac`
+重采样（同一时基、同一时刻），所以 CH1 触发时 CH2 也是对齐的。
+
+**没找到怎么办**：先按"信号中点"再试一次 —— `App_AutoLevel()` 扫 640 点取 `(min+max)/2`，
+与当前 `level_mv` 不同就改电平重试；命中则把新电平写回 `s_st.trig_level_mv`（菜单里能看到它变了）。
+这就是"单极性 PWM 默认 0 V 触发电平怎么都钉不住"的解法（问题 31）。纯直流信号没有穿越点，
+AUTO 也救不了，此时按没触发处理。
+
+| 状态 | 触发源 | 标记 | 显示 |
+|---|---|---|---|
+| `APP_TRIG_STATE_OFF` | 不搜索 | 不画 | 自由滚动，`win_start = 160` |
+| `APP_TRIG_STATE_LOCKED` | 命中 | 灰虚线 | 钉住，`win_start = 0` |
+| `APP_TRIG_STATE_MISSING` | 未命中 | 红虚线 | 自由滚动，`win_start = 160` |
+
+**经验**
+- 触发不改变采样率，只改变"从哪一点开始显示"；窗口始终是 320 点。
+- 返回 `index`（前一拍）而不是 `index+1`，是为了让"窗口起点 = index − pre"永远合法。
+- 两路共用一个触发点：要看另一路触发就切 `Trig src`（或按 KEY1，见 15.8），不要做两套独立触发。
+
+### 15.5 触发电平标记与增量刷新
+
+`WaveView_Data` 里加了两个字段：
+
+```c
+int32_t trig_mv;      /* 触发电平（mV） */
+uint8_t trig_state;   /* 0=关 1=锁定 2=未触发 */
+```
+
+标记的 y 和波形用同一个映射：
+
+```
+y = VIEW_WAVE_MID_Y − trig_mv × VIEW_PX_PER_VDIV / vdiv_mv
+  = 117 − trig_mv × 19 / vdiv_mv          // 钳到 [22, 211]
+```
+
+叠加层 `Wave_OverlayTrigger()` 在行合成之后画：从 `x = 2` 开始"亮 2 灭 2"的虚线，宽度铺满 320 点，
+再在 `x = 1..5` 画一个小实心方块（左端锚点）。颜色：
+
+| 状态 | 颜色 | 实际观感 |
+|---|---|---|
+| 锁定（1） | `VIEW_COLOR_LABEL`（0x8410 灰） | 灰 |
+| 未触发（2） | `VIEW_COLOR_SELECT`（0xF800 红） | 偏青/偏蓝（面板 R/B 反序，见 6.8） |
+| 关闭（0） | 不画 | — |
+
+标记是"叠加层"不是数据：`Wave_FlushRows()` 先合成行模板，再叠 CH1、CH2，最后如果这一行
+`y == trig_y` 才叠标记；哈希比较在最后，所以标记不变时这一行仍然跳过 SPI。
+
+增量刷新的关键在"标脏哪几行"：`WaveView_DrawTrace()` 每帧把**上一帧的标记行**（若上一帧状态≠0）
+和**这一帧的标记行**（若本帧状态≠0）都标脏，然后只重画脏行。标记从"灰"变"红"、或电平被 AUTO
+改写时，旧行会被恢复成纯波形/网格，新行画上新标记 —— 不需要整屏重画。关掉触发时状态=0，
+旧行标脏后自然把标记擦掉。
+
+**注意**：菜单弹窗（15.6）覆盖 y = 42..191，正好盖住中线 y = 117，所以**在菜单里调电平时看不到
+那条虚线**，只能看 `Trig level` 的数值；按 KEY2 退出菜单时 `WaveView_Invalidate()` 会整片重画，
+线就出现了。这是覆盖式弹窗的固有限制，不是标记没画。
+
+**经验**
+- 标记画在"行合成"阶段，不写进 `s_mv*` 数据，所以它不影响测量、也不进帧缓存。
+- 增量刷新下，任何"每帧都可能变"的叠加层都必须参与标脏和哈希，否则会留下残影。
+- 颜色按"配置值"写文档会误导：这个面板的红实际发青，认线时以实际观感为准（6.8）。
+
+### 15.6 设置菜单
+
+弹窗是覆盖式绘制（不保存底下内容），几何参数集中在 `ScopeMenu.c` 顶部：
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `MENU_W` / `MENU_H` | 220 / 150 | 6 行，比 5 行版高 20 |
+| `MENU_X` | `(320−220)/2 = 50` | 水平居中 |
+| `MENU_Y` | 42 | 波形区 22..211 内垂直居中：`22 + (190−150)/2` |
+| `MENU_ROW_Y(i)` | `MENU_Y + 24 + i×20` | i=0..5 → 66 / 86 / 106 / 126 / 146 / 166 |
+| 标题 | `MENU_Y + 4` | "SETTINGS"，红字 |
+| 底部提示 | `MENU_Y + MENU_H − 字号 − 4` | "KEY2: back   ROT: change"，灰字 |
+
+六行的取值来源与编码器2 的行为：
+
+| 行 | 名称 | 值 | 编码器2 改什么 |
+|---|---|---|---|
+| 0 | `V/div` | 100 mV … 10 V（7 档，双通道共用） | 换档 + `Frontend_SetRange()`（≤1 V 档 = S，≥2 V 档 = W） |
+| 1 | `Time/div` | 20 µs … 100 ms（12 档） | 换档 + 重算 `sps`（`40 000 000 / tdiv_us`，钳 1 k..1 M） |
+| 2 | `Trig src` | CH1 / CH2 | 只切触发源 |
+| 3 | `Trig edge` | OFF / RISE / FALL | mod 3 循环 |
+| 4 | `Trig level` | 带符号 mV | 步进 `V/div ÷ 10`，钳 ±5 格 |
+| 5 | `Cal` | CH1 / CH2 | 该行特殊：KEY1 切通道、KEY4 开始标定，编码器2 不改值 |
+
+按键映射（菜单打开时）：
+
+| 输入 | 行为 |
+|---|---|
+| 编码器1 | 在 6 行之间上下移动（循环） |
+| 编码器2 | 改当前行的值（`Cal` 行除外） |
+| KEY2 | 退出菜单：`menu = 0`、`WaveView_Invalidate()`，下一帧整片重画 |
+| KEY1 / KEY4 | 只在 `Cal` 行有效（切通道 / 启动标定） |
+| KEY3 | 菜单里不响应 |
+
+每行绘制顺序：整行底色（选中 `VIEW_COLOR_SELECT` 红底，否则 `VIEW_COLOR_BAR_BG` 黑底）→
+左标签（左对齐）→ 右侧数值（用 `Lcd_TextWidth()` 右对齐）。数值格式化集中成四个函数：
+
+| 函数 | 例 |
+|---|---|
+| `Menu_FormatVdiv` | `500mV` / `1.00V` |
+| `Menu_FormatTdiv` | `1.00ms` / `20us` |
+| `Menu_FormatEdge` | `OFF` / `RISE` / `FALL` |
+| `Menu_FormatLevel` | `+500mV` / `-1.20V` |
+
+**经验**
+- 覆盖式弹窗最简单：不用保存背景，但退出时必须整片重画（`WaveView_Invalidate()`），否则波形区会
+  残留弹窗边角。
+- 菜单里只响应 KEY2 和两个编码器，KEY3/KEY4 不响应，避免"想调电平却把运行状态切了"。
+- 单位换算只写在格式化函数里：以后加"自动量程"时只改这四个函数和取值表，不动绘制。
+
+### 15.7 逐通道两点标定
+
+**数据模型**：`(通道, 量程)` 四套参数，每套只存两个原始码值 —— 零点 `zero_raw`（接 GND 采到）和
+满点跨度 `span_raw`（接 3.3 V 采到的码值减零点）。其余全部派生：
+
+```
+输入 mV = (raw − zero_raw) × 3300 / span_raw
+```
+
+| 派生量 | 公式 | WIDE 例（zero=1950, span=195） |
+|---|---|---|
+| `gain_num` / `gain_den` | 4095 / span | 4095 / 195 |
+| `zero_mv` | `(zero×3300 + 2047) / 4095` | 1571 mV |
+| `min_mv` | `−zero×3300 / span` | −33 000 mV |
+| `max_mv` | `(4095−zero)×3300 / span` | +36 300 mV |
+| `lsb_milli_mv` | `3300×1000 / span` | 16 923（即 16.923 mV/LSB） |
+
+上电默认值（两通道相同，标定后各自独立）：
+
+| 量程 | `zero_raw` | `span_raw` |
+|---|---|---|
+| SMALL（S，前 4 档 V/div） | 1321 | 1453 |
+| WIDE（W，后 3 档 V/div） | 1950 | 195 |
+
+**flash 记录**（28 B = 7 个 32 位字，放扇区 11 起始 `0x080E0000`）：
+
+| 偏移 | 大小 | 字段 | 值 |
+|---|---|---|---|
+| 0x00 | 4 | `magic` | `0x314C4143`（"CAL1"） |
+| 0x04 | 4 | `version` | 1 |
+| 0x08 | 8 | `zero_raw[2][2]` | [通道][量程] |
+| 0x10 | 8 | `span_raw[2][2]` | [通道][量程] |
+| 0x18 | 4 | `checksum` | 前 6 个字之和 |
+
+**防错**：写 RAM 之前先校验"码值差"，落在设计窗口才接受：
+
+| 量程 | 合法码值差 | 说明 |
+|---|---|---|
+| WIDE | 125 – 270 | 3.3 V 输入应产生约 195 码 |
+| SMALL | 950 – 1900 | 应产生约 1453 码 |
+
+窗口不匹配说明"跳线位置与 V/div 档位错配"（例如软件以为在 W、硬件还在 S），此时拒绝标定并提示
+`CAL FAIL: 3V3/RANGE?`，避免把错误的比例固化进 flash（呼应问题 23）。
+
+**保存步骤**（`Frontend_CalSave()`）：`HAL_FLASH_Unlock()` → 清 EOP/OPERR/WRPERR/PGAERR/PGPERR/PGSERR
+→ `HAL_FLASHEx_Erase()`（`FLASH_SECTOR_11`、BANK_1、`VOLTAGE_RANGE_3`、1 个扇区）→ 逐字
+`HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD)` × 7 → `HAL_FLASH_Lock()`。擦除 128 KB 扇区约 1–2 s，
+期间取指停顿、屏幕停在 `CAL SAVING...`，属正常。
+
+**上电读回**（`Frontend_Init()`）：`magic`、`version`、`checksum` 全对且四组 `(zero, span)` 都合法
+才用 flash 值，否则整组回落到设计默认值 —— 这样"整片擦除把标定擦了"不会让设备读到随机数据。
+
+**设备流程**（`Cal` 行按 KEY4 进入）：
+
+| 状态 | 界面提示 | KEY4 | 其它键 |
+|---|---|---|---|
+| `APP_CAL_GND` | `CAL CHx/S GND KEY4  K1:CH K2:ESC` | 采 64 次取平均存 `s_cal_zero_raw` → SPAN | KEY1 换通道并回 GND；KEY2 取消 |
+| `APP_CAL_SPAN` | `CAL CHx/S 3V3 KEY4  K1:CH K2:ESC` | 采 64 次平均，`span = raw − zero`，校验并写 RAM/flash | 同上 |
+| `APP_CAL_DONE` | `CAL OK  SAVED` / `CAL OK  SAVE FAIL` | 立即退出 | 1.5 s 后自动退出，KEY2 也退出 |
+
+失败时不会进 `DONE`：采样失败提示 `CAL FAIL: ADC BUSY  KEY4`，码值差不在窗口提示
+`CAL FAIL: 3V3/RANGE? KEY4`，都停在当前步骤等重试（KEY2 取消）。
+
+标定期间 `running = 0`（暂停采集），每次采样都持总线锁（64 次 `ADC_Drv_ReadOnce`，几十 µs×64），
+结束后恢复原来的 RUN/HOLD 状态并回到菜单。`Frontend_Calibrate()` 成功即已写入 RAM 并生效，
+`Frontend_CalSave()` 只负责掉电保存 —— 所以看到 `CAL OK  SAVE FAIL` 时，本次标定仍可用，只是重启会丢。
+
+**经验**
+- 码值差就是增益的倒数：不需要知道 1.65 V、500 Ω 这些标称值，两点直接消掉所有比例误差。
+- 防错窗口比精度更重要：量程/跳线错配时读数会差 4–5 倍（问题 23），窗口校验能在标定这一步拦住。
+- 先写 RAM 再写 flash：flash 失败不影响本次使用，提示里也把"已生效"和"已保存"分开说。
+
+### 15.8 KEY1 的"当前通道"语义（10 月 22 日）
+
+KEY1 现在同时改三个消费者：
+
+| 消费者 | 字段 | 作用 |
+|---|---|---|
+| 参数栏测量 | `s_st.measure_ch` | 底部 F / T / Vpp / RMS / DC 测哪一路 |
+| 触发源 | `s_st.trig_src` | 哪一路被"钉住"（`App_Capture` 里二选一） |
+| 标定目标 | `s_cal_ch` / `s_st.measure_ch` | `Cal` 行要标哪一路 |
+
+三处入口都要同步，少一处就会出现"选中的没钉住、没选中的反而钉住"：
+
+```c
+/* App_HandleMain 的 KEY1、App_HandleMenu 的 Cal 行 KEY1 */
+s_st.measure_ch = (s_st.measure_ch == 1U) ? 2U : 1U;
+s_st.trig_src   = s_st.measure_ch;
+
+/* App_CalStart / App_CalHandle 的 KEY1 */
+s_st.trig_src   = s_cal_ch;
+```
+
+菜单里的 `Trig src` 行仍可单独指定触发源（例如"用 CH1 触发、看 CH2 参数"），之后按 KEY1 会重新同步。
+
+**经验**：用户说的"当前通道"是一个整体概念，不是某一个字段；凡是"跟着 KEY1 走"的东西，
+列一张消费者表逐个改，比事后按现象修更稳。
+
+### 15.9 资源占用与验证状态
+
+| 项目 | 当前值 | 占比 |
+|---|---|---|
+| FLASH | 64 120 B / 1 MB | 6.11 % |
+| RAM | 56 088 B / 128 KB | 42.79 % |
+| CCMRAM | 0 B | — |
+
+各阶段的增量（用于以后判断"哪次改动贵"）：
+
+| 阶段 | FLASH | RAM |
+|---|---|---|
+| 触发功能之前 | 52 532 B | 52 008 B |
+| + 640 点采集与触发查找 | 54 228 B | 55 864 B |
+| + 亚采样插值 | 54 844 B | 55 864 B |
+| + AUTO 电平 | 55 048 B | 55 864 B |
+| + 调度修复（让 1 tick / 有界取锁） | 55 304 B | 55 864 B |
+| + 逐通道标定（含 HAL flash 驱动） | 64 088 B | 56 088 B |
+| + KEY1 同步触发源 | 64 120 B | 56 088 B |
+
+**帧率预期**：40 kSa/s、稳定触发时，行指纹大部分命中，一帧只刷变化的几十行，实测约 26–43 fps；
+没触发/自由滚动时每帧整片重画（46–122 KB、50–110 ms），看起来会慢 —— 这不是"又退化了"，而是
+触发确实没找到点（红线）。1 kSa/s 时一帧本身就要 640 ms，按键响应靠 ui 的有界取锁保持可用。
+
+**验证状态**：以上全部只经过 ARM 构建（`-Wall` 零警告）+ 静态审查，**未上板实测**。上板重点：
+
+1. 1 kHz 正弦、默认 500 mV/div：波形应钉住，电平线为灰色；
+2. 把 `Trig level` 调到信号范围外：线变红/青、波形自由滚动，AUTO 不应死循环；
+3. `KEY1` 切 CH2：CH2 应被钉住（线仍是灰的），参数栏同时切到 CH2；
+4. 两路分别接 GND / 3.3 V 各按一次 KEY4：看到 `CAL OK SAVED`，之后两路读同一信号应一致；
+5. 断电重上电：flash 标定值应还在；
+6. 50 ms/div（1 kSa/s）：按键/编码器仍应即时响应，只是画面约 0.6 s 一帧。

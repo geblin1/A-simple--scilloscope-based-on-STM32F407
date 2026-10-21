@@ -10,19 +10,29 @@
 
 #include <stdint.h>
 
+#include "Trigger.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define SCOPE_MENU_ROWS     2U
-#define SCOPE_MENU_ROW_VDIV 0U
-#define SCOPE_MENU_ROW_TIM  1U
+#define SCOPE_MENU_ROWS           6U
+#define SCOPE_MENU_ROW_VDIV       0U
+#define SCOPE_MENU_ROW_TIM        1U
+#define SCOPE_MENU_ROW_TRIG_SRC   2U
+#define SCOPE_MENU_ROW_TRIG_EDGE  3U
+#define SCOPE_MENU_ROW_TRIG_LEVEL 4U
+#define SCOPE_MENU_ROW_CAL        5U   /* 前端标定：KEY1 选通道、KEY4 开始 */
 
 typedef struct
 {
-    uint8_t  sel;        /* 当前选中行 0~1 */
-    uint16_t vdiv_mv;    /* 垂直档位（双通道共用） */
-    uint32_t tdiv_us;    /* Time/div */
+    uint8_t      sel;          /* 当前选中行 0~5 */
+    uint16_t     vdiv_mv;      /* 垂直档位（双通道共用） */
+    uint32_t     tdiv_us;      /* Time/div */
+    uint8_t      trig_src;     /* 触发通道：1 = CH1，2 = CH2 */
+    Trigger_Edge trig_edge;    /* 触发边沿：关 / 上升 / 下降 */
+    int32_t      trig_level_mv;/* 触发电平（mV，带符号） */
+    uint8_t      measure_ch;   /* Cal 行显示要标定的通道：1 = CH1，2 = CH2 */
 } ScopeMenu_Info;
 
 /**

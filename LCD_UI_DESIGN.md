@@ -185,23 +185,28 @@ y_pixel = mid - round(volts / vdiv * 19)
 | 屏幕 | 布局 | 说明 |
 | :--- | :--- | :--- |
 | **MAIN** | §2 的三段式 | 示波器主界面，波形实时刷新 |
-| **MENU** | 波形区改为 5 行菜单，状态栏与参数栏保留 | 行高 38 px，左侧 `▶` 指示当前项，右侧显示当前值 |
-| **EDIT** | 同 MENU，当前行的值反白 | 编码器 1 改值，KEY1 确认返回 MENU |
+| **MENU** | 波形区改为覆盖式弹窗，状态栏与参数栏保留 | 行高 20 px，左侧项目名、右侧当前值，选中行红底 |
+| **EDIT** | （未实现，编码器直接改值） | — |
 
-> **实际实现（v1）与上表的差异**：第一版用的是**覆盖在波形区中央的 220×78 小弹窗**（`ScopeMenu.c`），
-> 不是整页 5 行菜单，也没有 MENU/EDIT 两级状态——选中行用红底表示，编码器 1 移行、编码器 2 改值。
-> 弹窗只有 **2 行**：`V/div` 与 `Time/div`，因为 **V/div 由双通道共用**
-> （保证同屏两条波形使用同一套电压→像素换算）。完整按键说明见 `CONTROLS.md`。
+> **实际实现（v3）与上表的差异**：当前用的是**覆盖在波形区中央的 220×150 小弹窗**（`ScopeMenu.c`），
+> 不是整页菜单，也没有 MENU/EDIT 两级状态——选中行用红底表示，编码器 1 移行、编码器 2 改值、
+> KEY2 返回。弹窗共 **6 行**（`V/div`、`Time/div`、`Trig src`、`Trig edge`、`Trig level`、`Cal`）：
+> **V/div 由双通道共用**（保证同屏两条波形使用同一套电压→像素换算）；
+> `Cal` 行显示当前要标定的通道，用 KEY1 切换通道、KEY4 启动两点标定；
+> 触发开启时波形区额外画一条 2 亮 2 灭的**触发电平虚线**（灰 = 已锁定，红 = 未触发；
+> 因本面板 R/B 通道顺序相反，未触发色实际显示偏青/偏蓝，见 §7.3 的实测说明）。
+> 完整按键说明见 `CONTROLS.md`。
 
-菜单项（占 5 行，其余留空）：
+菜单项（实际实现的 6 行）：
 
 | 行 | 项目 | 可调值 |
 | :--- | :--- | :--- |
-| 1 | V/div（当前通道） | 100 mV ~ 5 V，1-2-5 步进 |
-| 2 | Time/div | 20 µs/div ~ 100 ms/div，1-2-5 步进 |
-| 3 | 通道显示 | `CH1` / `CH2` / `CH1+CH2` |
-| 4 | 前端模式 | `DC×1` / `DC×10` / `AC×1` / `AC×10` |
-| 5 | 恢复默认 | 长按确认后重置档位 |
+| 1 | V/div | 100 / 200 / 500 / 1000 / 2000 / 5000 / 10000 mV（双通道共用） |
+| 2 | Time/div | 20 µs ~ 100 ms，1-2-5 步进 |
+| 3 | Trig src | `CH1` / `CH2` |
+| 4 | Trig edge | `OFF` / `RISE` / `FALL` |
+| 5 | Trig level | ±5 格，步进 `V/div ÷ 10` |
+| 6 | Cal | `CH1` / `CH2`（KEY1 切换，KEY4 启动两点标定） |
 
 ---
 
@@ -211,29 +216,37 @@ y_pixel = mid - round(volts / vdiv * 19)
 
 | 按键 | MAIN 界面 | MENU 界面 | EDIT 界面 |
 | :--- | :--- | :--- | :--- |
-| KEY1（PE2） | 测量项切换 | 切换到 EDIT 编辑当前项 | 确认 |
+| KEY1（PE2） | 切换当前通道（参数栏测 CH1/CH2，同时切触发源） | 选中 `Cal` 行时切换要标定的通道（同时切触发源） | — |
 | KEY2（PE3） | 进入 MENU | 返回 MAIN（取消） | 取消 |
-| KEY3（PE4） | 切换**通道选择**（当前选中哪一路） | 移到上一项 | — |
-| KEY4（PE5） | 运行 / 停止（RUN↔HOLD） | 移到下一项 | — |
+| KEY3（PE4） | 切换**显示组合**（双路 → 仅 CH1 → 仅 CH2 循环） | 不响应 | — |
+| KEY4（PE5） | 运行 / 停止（RUN↔HOLD） | 选中 `Cal` 行时启动两点标定 | — |
 
-> `Key.c` 现有 `Key_Tick()` 是**每 20 次调用采样一次、松手沿上报**（`User/BSP/Src/Key.c:43-61`）。
-> 20 次调用在 `while(1)` 里没有任何延时约束，**节奏取决于主循环速度**——加进 UI 循环后必须由固定时基驱动（建议 TIM6 1 kHz 中断里调 `Key_Tick()`，或主循环固定 1 ms 节拍）。这一点会驱动代码时一并处理。
+> **实际实现（v3）**：菜单打开时 **KEY2（返回）** 和两个编码器始终有效；KEY1 / KEY4 只在
+> 选中 `Cal` 行时有定义（换通道 / 启动标定）；KEY3 在菜单里不响应。
+> 没有 EDIT 二级界面，编码器直接改值。标定流程进行中时只响应 KEY1（换通道）、
+> KEY2（取消）、KEY4（采当前点），编码器不参与。
+>
+> **Key_Tick 的时基（实际实现）**：`Key_Tick()` 由 **TIM7 1 ms 中断**调用（TIM7 同时是 HAL
+> 时基，见 `Core/Src/stm32f4xx_hal_timebase_tim.c` 与 `main.c` 的中断回调），每 20 次调用
+> （20 ms）采样一次 PE2~PE5，在松手沿把键号写入 `Key_Num`（`User/BSP/Src/Key.c:43-61`）。
+> 因而消抖节奏与主循环负载无关，`while(1)` 里不需要再凑 1 ms 节拍。
 
 ### 7.2 编码器（硬件编码器模式，无需消抖）
 
 | 编码器 | MAIN 界面 | MENU 界面 | EDIT 界面 |
 | :--- | :--- | :--- | :--- |
-| 编码器1（PC6/PC7 = TIM8） | 调 **V/div**（当前通道） | 上下移动光标 | **改当前项的值** |
-| 编码器2（PB6/PB7 = TIM4） | 调 **Time/div** | — | — |
+| 编码器1（PC6/PC7 = TIM8） | 调 **V/div**（双通道共用） | 上下移动光标（6 行循环） | **改当前项的值** |
+| 编码器2（PB6/PB7 = TIM4） | 调 **Time/div** | 改选中行的值（V/div、Time/div、触发项） | — |
 
-> 当前 `Encoder.c` 只返回 `htim8`（编码器1），且读取不清零（`SET_COUNTER` 被注释）。
-> 需新增 `Encoder_GetDelta(ENC_1/ENC_2)`：读取后**写 0 并返回有符号差值**。
-> TIM4 之前没启动过（已在 TROUBLESHOOTING 问题 5 修好），可用性需实测确认。
+> **实际实现**：`User/BSP/Src/EncoderDrv.c` 已用 TIM8（编码器1，PC6/PC7）与 TIM4
+> （编码器2，PB6/PB7）的硬件编码器模式 x4 计数；`EncoderDrv_ReadDelta(ENCODER_DRV_1/2)`
+> 读取当前计数并与上次值求差（int16），再按 4 计数/格 折算成“格”，返回有符号格数。
+> 旧 `Encoder.c`（只有 `Encoder_Get()`）是早期遗留，未被调用。
 
 ### 7.3 水平/垂直档位的 1-2-5 序列
 
 ```c
-static const uint16_t vdiv_mv[] = {100, 200, 500, 1000, 2000, 5000};      /* 6 档 */
+static const uint16_t vdiv_mv[] = {100, 200, 500, 1000, 2000, 5000, 10000}; /* 实际 7 档 */
 static const uint32_t tdiv_us[] = {20, 50, 100, 200, 500, 1000,
                                    2000, 5000, 10000, 20000, 50000, 100000}; /* 12 档 */
 ```
@@ -268,6 +281,13 @@ static const uint32_t tdiv_us[] = {20, 50, 100, 200, 500, 1000,
 │  ADC_Drv（已交付，不再改动）                     │
 └───────────────────────────────────────────────┘
 ```
+
+> **实际实现（10 月 22 日）**：分层比上图更细——`App`（`App_Scope.c`、`ScopeMenu.c`、`App_Rtos.c`）
+> → `View`（`View.c` / `WaveView.c` / `StatusBar.c` / `ParamBar.c`）与 `Algorithm`（`Measure.c`、
+> `Trigger.c`）→ `BSP`（`Lcd.c`、`Font.c`、`EncoderDrv.c`、`Key.c`、`ADC_Drv.c`、`Frontend.c` 等）。
+> `View` 与 `Algorithm` 都不包含 HAL 头文件，只认“mV / 采样率”；菜单只有 MAIN/MENU 两级
+> （无 EDIT），标定流程是 MENU 内的子状态；编码器由 `EncoderDrv.c`（TIM8/TIM4）提供，
+> 不是设计稿里的 `Encoder.c`。
 
 **Lcd.h 计划 API**（确认布局后实现）：
 
@@ -321,7 +341,7 @@ ST7789 的 MADCTL 决定方向。横屏 320×240 与常见代码写法：
 | 曲线 y 缓存（prev/cur × 2 路） | 4 × 640 = **2,560 B** | 用来算"旧线 ∪ 新线"的脏行 |
 | 脏行位图 `s_dirty[24]` | **24 B** | 190 行，每行 1 bit |
 | 行指纹 `s_row_hash[190]` | **760 B** | 合成结果没变就整行不发 |
-| 采样缓冲 | 1024 × 4 = **4 KB** | 已由 ADC_Drv 使用 |
+| 采样缓冲 | 640 × 4 B = **2.5 KB** | `s_raw[APP_CAP_RAW]`（`APP_CAP_RAW` = 640）；另有 `s_mv1`/`s_mv2` 各 640 × 4 B |
 
 **整屏刷新**：153,600 B ÷ 1.31 MB/s ≈ **117 ms**——现在只有上电（`View_DrawFrame`）和弹菜单后
 （`WaveView_Invalidate`）才会付这笔开销。
@@ -333,7 +353,7 @@ ST7789 的 MADCTL 决定方向。横屏 320×240 与常见代码写法：
 | 波形区 | 121.6 KB | 约 26~45 KB | 只发"旧线 ∪ 新线"覆盖到的行，每行 640 B；合成后与上一帧相同则整行跳过 |
 | 状态栏 | 14 KB | 0 KB（多数帧） | 内容不变直接跳过 |
 | 参数栏 | 17.9 KB | 约 2~4 KB | 字段级增量，只重画变化的字段 |
-| **合计** | **约 166 KB ≈ 127 ms（8 fps）** | **约 30~50 KB ≈ 23~38 ms（26~43 fps）** | 实际帧率还要叠加采集时间（40 kSa/s 采 320 点 = 8 ms） |
+| **合计** | **约 166 KB ≈ 127 ms（8 fps）** | **约 30~50 KB ≈ 23~38 ms（26~43 fps）** | 实际帧率还要叠加采集时间（40 kSa/s 采 640 点 = 16 ms；触发功能上线前是 320 点 = 8 ms） |
 
 **结论**：本次优化额外占用 RAM **4.75 KB**（实测 38,656 B → 43,408 B），Flash 4.18%（43,788 B）。
 不采用 320×190 的整屏影子缓冲——那要额外 **121.6 KB**，128 KB SRAM 里分摊不起。
@@ -362,16 +382,19 @@ ST7789 的 MADCTL 决定方向。横屏 320×240 与常见代码写法：
 
 | 场景 | 用户动作 | 屏幕反应 | 涉及模块 |
 | :--- | :--- | :--- | :--- |
-| 上电 | — | 全屏填充背景 → 状态栏/参数栏/网格 → 开始采集 | `LCD_Init` + `App_Scope` |
-| 运行中 | 旋转编码器1 | 状态栏 V/div 变化，波形纵向缩放 | `Encoder` + `WaveView` |
-| 运行中 | 旋转编码器2 | 状态栏 Time/div 变化，采样率随之改变 | `Encoder` + `ADC_Drv_SetSampleRate` |
+| 上电 | — | 全屏填充背景 → 状态栏/参数栏/网格 → 显示 `PRESS KEY4 TO RUN` | `Lcd_Init` + `App_Scope` |
+| 运行中 | 旋转编码器1 | 状态栏 V/div 变化，波形纵向缩放（两路共用） | `EncoderDrv` + `App_Scope` + `WaveView` |
+| 运行中 | 旋转编码器2 | 状态栏 Time/div 变化，采样率随之改变 | `EncoderDrv` + `ADC_Drv_SetSampleRate` |
 | 运行中 | KEY4 | `RUN` ↔ `HOLD`，停止采集冻结波形 | `Key` + `App_Scope` |
-| 运行中 | KEY3 | 当前选中通道在 CH1 / CH2 间切换 | `Key` + `StatusBar` |
-| 运行中 | KEY1 | 参数栏在 全部 / 仅 Vpp / 仅频率 之间切换 | `Key` + `ParamBar` |
-| 运行中 | KEY2 | 进入 MENU | `Key` + `ScopeMenu` |
-| MENU | 编码器1 / KEY3/KEY4 | 光标移动 | `ScopeMenu` |
-| MENU | KEY1 | 进入 EDIT | `ScopeMenu` |
-| EDIT | 编码器1 | 改当前项的值（1-2-5 步进） | `ScopeMenu` |
-| EDIT | KEY1 | 确认并返回 MENU | `ScopeMenu` |
-| 空闲 5 s | — | 自动从 MENU/EDIT 回 MAIN | `ScopeMenu` |
-| 任意 | 主循环 | PC8 每 500 ms 翻转 | `LED` |
+| 运行中 | KEY3 | 显示组合循环：双路 → 仅 CH1 → 仅 CH2 | `Key` + `WaveView` |
+| 运行中 | KEY1 | 切换当前通道：参数栏测量 + 触发源（+ 标定目标）一起切 | `Key` + `App_Scope` + `StatusBar` |
+| 运行中 | KEY2 | 进入 MENU（弹出 220×150 设置菜单） | `Key` + `ScopeMenu` |
+| MENU | 编码器1 | 光标在 6 行间循环移动 | `ScopeMenu` |
+| MENU | 编码器2 | 改当前行的值（V/div、Time/div、Trig src/edge/level） | `ScopeMenu` + `App_Scope` |
+| MENU | KEY1 / KEY4 | 只有光标在 `Cal` 行时有效：换标定通道 / 启动两点标定 | `ScopeMenu` + `App_Scope` |
+| MENU | KEY2 | 返回 MAIN（关闭菜单） | `ScopeMenu` |
+| 标定 | KEY1 / KEY4 / KEY2 | 换通道重来 / 采当前点（GND → 3.3 V）/ 取消 | `App_Scope` + `Frontend` |
+
+> **实际实现（10 月 22 日）**：没有 EDIT 二级界面，编码器直接改值；也没有“空闲 5 s 自动回 MAIN”。
+> 菜单打开期间 KEY3 不响应（保持当前显示组合）。`Encoder` 模块已由 `EncoderDrv.c` 取代。
+| 任意 | 1 ms 定时中断 | PC8 每 500 ms 翻转（RUN / HOLD 相同） | `LED` |

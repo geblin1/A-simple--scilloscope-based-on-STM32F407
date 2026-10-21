@@ -121,6 +121,8 @@ typedef struct
     uint16_t        vdiv_mv2;
     uint8_t         show1;
     uint8_t         show2;
+    int32_t         trig_mv;    /* 触发电平（mV）；trig_state = 0 时不画 */
+    uint8_t         trig_state; /* 0 = 触发关闭，1 = 已锁定，2 = 未找到触发点 */
 } WaveView_Data;
 
 /* ================================================================== */
