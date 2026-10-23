@@ -422,7 +422,7 @@ void WaveView_DrawTrace(const WaveView_Data *data)
     trig_state = data->trig_state;
     if (trig_state != 0U)
     {
-        trig_y = Wave_SampleToY(data->trig_mv, data->vdiv_mv1);
+        trig_y = Wave_SampleToY(data->trig_mv, data->vdiv_mv_trig);
     }
 
     if (s_row_ready == 0U)

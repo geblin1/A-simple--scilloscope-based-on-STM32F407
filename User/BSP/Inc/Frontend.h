@@ -23,10 +23,10 @@
   * 结果保存到 flash 最后一个扇区（0x080E0000），上电由 Frontend_Init()
   * 读回；没有有效数据时退回设计默认值。
   *
-  * 跳线位置软件无法检测（没有检测引脚），所以量程由 App 层根据 V/div 档位选定，
-  * 界面用 S / W 提示用户当前应该把跳线插在哪一档（见 Frontend_JumperHint）。
-  * 标定时会校验实测码值差是否落在当前量程的预期区间内，防止把
-  * "跳线位置和 V/div 不一致"采到的数据固化成标定值。
+  * 跳线位置软件无法检测（没有检测引脚），所以每个通道的量程分别由 App 层
+  * 根据该通道的 V/div 档位选定，界面用 S / W 分别提示两路应该把跳线插在哪一档
+  * （见 Frontend_JumperHint）。标定时会校验实测码值差是否落在当前量程的预期
+  * 区间内，防止把错配采到的数据固化成标定值。
   */
 
 #ifndef __FRONTEND_H
@@ -81,22 +81,22 @@ uint8_t Frontend_Calibrate(uint8_t channel, uint16_t zero_raw, uint16_t span_raw
   */
 uint8_t Frontend_CalSave(void);
 
-/* ---- 量程选择 ---- */
+/* ---- 量程选择（逐通道：两路前端可以处在不同量程） ---- */
 
-/** 设置当前使用的量程（只影响换算，不碰硬件） */
-void Frontend_SetRange(Frontend_Range range);
+/** 设置某通道的当前量程（只影响换算，不碰硬件） */
+void Frontend_SetRange(uint8_t channel, Frontend_Range range);
 
-/** 读回当前量程 */
-Frontend_Range Frontend_GetRange(void);
+/** 读回某通道的当前量程 */
+Frontend_Range Frontend_GetRange(uint8_t channel);
 
-/** 量程单字母标识："W" / "S"，状态栏用 */
-const char *Frontend_RangeLetter(void);
+/** 某通道的量程单字母标识："W" / "S"，状态栏用 */
+const char *Frontend_RangeLetter(uint8_t channel);
 
-/** 量程名称："WIDE" / "SMALL"，菜单用 */
-const char *Frontend_RangeName(void);
+/** 某通道的量程名称："WIDE" / "SMALL"，菜单用 */
+const char *Frontend_RangeName(uint8_t channel);
 
-/** 当前量程要求的跳线乙位置："OPEN"（不插）/ "MID" */
-const char *Frontend_JumperHint(void);
+/** 某通道当前量程要求的跳线乙位置："OPEN"（不插）/ "MID" */
+const char *Frontend_JumperHint(uint8_t channel);
 
 /* ---- 换算 ---- */
 

@@ -79,16 +79,21 @@ typedef struct
 } Frontend_CalFlash;
 
 /* 设计默认值：没有有效标定时的兜底（下标 = 量程：WIDE=0 / SMALL=1）。
-   零点取设计模型值，码值差取 3.3 V 与 GND 的模型差；两个通道相同。 */
+   两个都是绝对码值：零点取设计模型值，span 取"接 3.3 V 时的码值"
+   （= 零点 + 模型码值差：WIDE 195、SMALL 1453）；两个通道相同。 */
 static const uint16_t k_default_zero_raw[FRONTEND_CAL_RANGE_COUNT] = { 1950U, 1321U };
-static const uint16_t k_default_span_raw[FRONTEND_CAL_RANGE_COUNT] = { 195U, 1453U };
+static const uint16_t k_default_span_raw[FRONTEND_CAL_RANGE_COUNT] = { 2145U, 2774U };
 
 static Frontend_Cal s_cal[FRONTEND_CAL_CH_COUNT][FRONTEND_CAL_RANGE_COUNT];
 static uint16_t     s_zero_raw[FRONTEND_CAL_CH_COUNT][FRONTEND_CAL_RANGE_COUNT];
 static uint16_t     s_span_raw[FRONTEND_CAL_CH_COUNT][FRONTEND_CAL_RANGE_COUNT];
 
-/* 上电默认小量程：与默认 V/div（500 mV/div）对应 */
-static Frontend_Range s_range = FRONTEND_RANGE_SMALL;
+/* 上电默认小量程：与默认 V/div（500 mV/div）对应。
+   两路前端可以各自处在不同量程（跳线乙分别设置），所以按通道各存一份。 */
+static Frontend_Range s_range[FRONTEND_CAL_CH_COUNT] =
+{
+    FRONTEND_RANGE_SMALL, FRONTEND_RANGE_SMALL
+};
 
 /* ------------------------------------------------------------------ */
 /* 内部工具                                                            */
@@ -100,15 +105,15 @@ static uint8_t Frontend_Ch_Index(uint8_t channel)
     return (channel == FRONTEND_CH2) ? 1U : 0U;
 }
 
-/* 当前量程对应的数组下标（Frontend_Range 的枚举值就是下标） */
-static uint8_t Frontend_Range_Index(void)
+/* 某通道当前量程对应的数组下标（Frontend_Range 的枚举值就是下标） */
+static uint8_t Frontend_Range_Index(uint8_t channel)
 {
-    return (uint8_t)s_range;
+    return (uint8_t)s_range[Frontend_Ch_Index(channel)];
 }
 
 static Frontend_Cal *Frontend_Cal_Of(uint8_t channel)
 {
-    return &s_cal[Frontend_Ch_Index(channel)][Frontend_Range_Index()];
+    return &s_cal[Frontend_Ch_Index(channel)][Frontend_Range_Index(channel)];
 }
 
 /* 校验和：结构体除最后一个 checksum 字之外所有 32 位字之和。
@@ -143,27 +148,63 @@ static uint8_t Frontend_Cal_PairValid(uint16_t zero_raw, uint16_t span_raw)
     return (diff >= FRONTEND_SPAN_MIN_RAW) ? 1U : 0U;
 }
 
-/* 由实测两点派生运行时参数 */
+/* 某个量程下"3.3 V 与 GND 的码值差"的合理区间。
+   用来同时识别"跳线/档位错配"和"旧格式 flash 数据"。 */
+static uint8_t Frontend_Cal_DiffInWindow(uint8_t range_idx, int32_t diff)
+{
+    if (range_idx == (uint8_t)FRONTEND_RANGE_WIDE)
+    {
+        return ((diff >= FRONTEND_SPAN_WIDE_MIN) && (diff <= FRONTEND_SPAN_WIDE_MAX)) ? 1U : 0U;
+    }
+    return ((diff >= FRONTEND_SPAN_SMALL_MIN) && (diff <= FRONTEND_SPAN_SMALL_MAX)) ? 1U : 0U;
+}
+
+/* flash 条目按"绝对码值"解释是否合理：zero = 接 GND 的码值，span = 接 3.3 V 的码值 */
+static uint8_t Frontend_Cal_EntryValid(uint8_t range_idx, uint16_t zero_raw, uint16_t span_raw)
+{
+    if (Frontend_Cal_PairValid(zero_raw, span_raw) == 0U)
+    {
+        return 0U;
+    }
+    return Frontend_Cal_DiffInWindow(range_idx, (int32_t)span_raw - (int32_t)zero_raw);
+}
+
+/* 兼容 2026-10-23 之前的旧格式：未标定的条目把 span 存成了"码值差"（195 / 1453），
+   而不是绝对码值。旧值本身落在该量程的码值差窗口内、且 zero + 差值不越界时，
+   可以安全迁移成绝对码值。 */
+static uint8_t Frontend_Cal_EntryLegacy(uint8_t range_idx, uint16_t zero_raw, uint16_t span_raw)
+{
+    if (Frontend_Cal_DiffInWindow(range_idx, (int32_t)span_raw) == 0U)
+    {
+        return 0U;
+    }
+    return (((uint32_t)zero_raw + (uint32_t)span_raw) <= (uint32_t)FRONTEND_RAW_FULL) ? 1U : 0U;
+}
+
+/* 由实测两点派生运行时参数。
+   注意：s_zero_raw 是"输入 0 V 时的码值"，s_span_raw 是"输入 3.3 V 时的码值"，
+   两者都是绝对码值；换算只用它们的差 (span − zero)，不能用 span 本身。 */
 static void Frontend_Cal_Apply(uint8_t ch_idx, uint8_t range_idx)
 {
     Frontend_Cal *cal  = &s_cal[ch_idx][range_idx];
     int32_t       zero = (int32_t)s_zero_raw[ch_idx][range_idx];
     int32_t       span = (int32_t)s_span_raw[ch_idx][range_idx];
+    int32_t       span_diff = span - zero;
 
-    if (span < FRONTEND_SPAN_MIN_RAW)
+    if (span_diff < FRONTEND_SPAN_MIN_RAW)
     {
-        span = FRONTEND_SPAN_MIN_RAW;      /* 防御：绝不留下 0 分母 */
+        span_diff = FRONTEND_SPAN_MIN_RAW;  /* 防御：绝不留下 0 分母 */
     }
 
     cal->zero_raw = zero;
     cal->gain_num = (int32_t)FRONTEND_RAW_FULL;
-    cal->gain_den = span;
+    cal->gain_den = span_diff;
 
     cal->zero_mv = (int32_t)((((int64_t)zero * FRONTEND_VREF_MV) +
                               (FRONTEND_RAW_FULL / 2)) / FRONTEND_RAW_FULL);
-    cal->min_mv  = (int32_t)(((int64_t)(-zero) * FRONTEND_VREF_MV) / span);
-    cal->max_mv  = (int32_t)(((int64_t)(FRONTEND_RAW_FULL - zero) * FRONTEND_VREF_MV) / span);
-    cal->lsb_milli_mv = (int32_t)(((int64_t)FRONTEND_VREF_MV * 1000) / span);
+    cal->min_mv  = (int32_t)(((int64_t)(-zero) * FRONTEND_VREF_MV) / span_diff);
+    cal->max_mv  = (int32_t)(((int64_t)(FRONTEND_RAW_FULL - zero) * FRONTEND_VREF_MV) / span_diff);
+    cal->lsb_milli_mv = (int32_t)(((int64_t)FRONTEND_VREF_MV * 1000) / span_diff);
 }
 
 /* ------------------------------------------------------------------ */
@@ -173,9 +214,11 @@ static void Frontend_Cal_Apply(uint8_t ch_idx, uint8_t range_idx)
 void Frontend_Init(void)
 {
     const Frontend_CalFlash *flash = (const Frontend_CalFlash *)FRONTEND_CAL_FLASH_ADDR;
-    uint8_t valid = 0U;
-    uint8_t ch;
-    uint8_t r;
+    uint8_t  valid = 0U;
+    uint8_t  ch;
+    uint8_t  r;
+    uint16_t zero;
+    uint16_t span;
 
     /* 先看魔数、版本和校验和；再逐个校验四点数据是否在合理范围内。
        任何一项不对就整体退回设计默认值，避免"半套标定"。 */
@@ -189,8 +232,10 @@ void Frontend_Init(void)
         {
             for (r = 0U; r < FRONTEND_CAL_RANGE_COUNT; r++)
             {
-                if (Frontend_Cal_PairValid(flash->zero_raw[ch][r],
-                                           flash->span_raw[ch][r]) == 0U)
+                if ((Frontend_Cal_EntryValid(r, flash->zero_raw[ch][r],
+                                             flash->span_raw[ch][r]) == 0U) &&
+                    (Frontend_Cal_EntryLegacy(r, flash->zero_raw[ch][r],
+                                              flash->span_raw[ch][r]) == 0U))
                 {
                     valid = 0U;
                 }
@@ -204,8 +249,17 @@ void Frontend_Init(void)
         {
             if (valid != 0U)
             {
-                s_zero_raw[ch][r] = flash->zero_raw[ch][r];
-                s_span_raw[ch][r] = flash->span_raw[ch][r];
+                zero = flash->zero_raw[ch][r];
+                span = flash->span_raw[ch][r];
+
+                if (Frontend_Cal_EntryValid(r, zero, span) == 0U)
+                {
+                    /* 旧格式：span 存的是码值差，迁移成"接 3.3 V 的绝对码值" */
+                    span = (uint16_t)((uint32_t)zero + (uint32_t)span);
+                }
+
+                s_zero_raw[ch][r] = zero;
+                s_span_raw[ch][r] = span;
             }
             else
             {
@@ -217,36 +271,38 @@ void Frontend_Init(void)
         }
     }
 
-    s_range = FRONTEND_RANGE_SMALL;
+    s_range[0] = FRONTEND_RANGE_SMALL;
+    s_range[1] = FRONTEND_RANGE_SMALL;
 }
 
 /* ------------------------------------------------------------------ */
 /* 量程选择                                                            */
 /* ------------------------------------------------------------------ */
 
-void Frontend_SetRange(Frontend_Range range)
+void Frontend_SetRange(uint8_t channel, Frontend_Range range)
 {
-    s_range = (range == FRONTEND_RANGE_WIDE) ? FRONTEND_RANGE_WIDE : FRONTEND_RANGE_SMALL;
+    s_range[Frontend_Ch_Index(channel)] =
+        (range == FRONTEND_RANGE_WIDE) ? FRONTEND_RANGE_WIDE : FRONTEND_RANGE_SMALL;
 }
 
-Frontend_Range Frontend_GetRange(void)
+Frontend_Range Frontend_GetRange(uint8_t channel)
 {
-    return s_range;
+    return s_range[Frontend_Ch_Index(channel)];
 }
 
-const char *Frontend_RangeLetter(void)
+const char *Frontend_RangeLetter(uint8_t channel)
 {
-    return (s_range == FRONTEND_RANGE_WIDE) ? "W" : "S";
+    return (s_range[Frontend_Ch_Index(channel)] == FRONTEND_RANGE_WIDE) ? "W" : "S";
 }
 
-const char *Frontend_RangeName(void)
+const char *Frontend_RangeName(uint8_t channel)
 {
-    return (s_range == FRONTEND_RANGE_WIDE) ? "WIDE" : "SMALL";
+    return (s_range[Frontend_Ch_Index(channel)] == FRONTEND_RANGE_WIDE) ? "WIDE" : "SMALL";
 }
 
-const char *Frontend_JumperHint(void)
+const char *Frontend_JumperHint(uint8_t channel)
 {
-    return (s_range == FRONTEND_RANGE_WIDE) ? "OPEN" : "MID";
+    return (s_range[Frontend_Ch_Index(channel)] == FRONTEND_RANGE_WIDE) ? "OPEN" : "MID";
 }
 
 /* ------------------------------------------------------------------ */
@@ -278,7 +334,7 @@ int32_t Frontend_RawToMv(uint8_t channel, uint16_t raw)
 uint8_t Frontend_Calibrate(uint8_t channel, uint16_t zero_raw, uint16_t span_raw)
 {
     uint8_t  ch   = Frontend_Ch_Index(channel);
-    uint8_t  r    = Frontend_Range_Index();
+    uint8_t  r    = Frontend_Range_Index(channel);
     uint32_t diff;
 
     if (Frontend_Cal_PairValid(zero_raw, span_raw) == 0U)
@@ -291,7 +347,7 @@ uint8_t Frontend_Calibrate(uint8_t channel, uint16_t zero_raw, uint16_t span_raw
     /* 码值差应该落在当前量程的设计区间内。跳线乙位置和 V/div 不一致时，
        差值是另一个量程的数量级，这里直接拒绝，避免把"用错量程"的数据
        写成标定值（那会把错配固化成正常状态）。 */
-    if (s_range == FRONTEND_RANGE_WIDE)
+    if (s_range[ch] == FRONTEND_RANGE_WIDE)
     {
         if ((diff < FRONTEND_SPAN_WIDE_MIN) || (diff > FRONTEND_SPAN_WIDE_MAX))
         {

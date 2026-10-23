@@ -2,21 +2,25 @@
   * @file    ScopeMenu.c
   * @brief   设置菜单绘制实现
   *
-  * 弹窗尺寸：220 x 150，居中覆盖在波形区。双通道共用同一个垂直档位，
-  * 所以垂直方向只有一项；随后四项是触发设置，最后一行是前端标定：
+  * 弹窗尺寸：220 x 170，居中覆盖在波形区。V/div 按“当前通道”分别设置，
+  * 行内同时显示两路的值（斜杠前是 CH1、斜杠后是 CH2）；随后四项是触发设置，
+  * 再下面一行是自动设置，最后一行是前端标定：
   *   +--------------------------------------+
   *   | SETTINGS                             |
-  *   | V/div                500mV           |  <- 选中行红底
+  *   | V/div C1             500m/2.0V       |  <- 选中行红底
   *   | Time/div             1.00ms          |
   *   | Trig src             CH1             |
   *   | Trig edge            RISE            |
   *   | Trig level           +0mV            |
+  *   | Auto set             KEY4            |
   *   | Cal                  CH1             |
   *   +--------------------------------------+
   *
   * 触发边沿显示 OFF / RISE / FALL 三个状态；电平带符号显示，
   * 一眼就能看出触发点在零线之上还是之下。
-  * Cal 行显示的是"要标定的通道"，KEY1 在菜单里切换（KEY4 启动两点标定）。
+  * Cal 行显示的是“要标定的通道”，KEY4 启动两点标定；KEY1 在菜单里任何一行
+  * 都切换“当前通道”（参数栏、触发源、V/div 行与 Cal 行都跟着走）。
+  * Auto set 行按 KEY4 执行自动设置：按当前帧自动选 V/div 与 Time/div。
   */
 
 #include "ScopeMenu.h"
@@ -26,10 +30,10 @@
 #include "ScopeView.h"
 
 #define MENU_W          220U
-#define MENU_H          150U
+#define MENU_H          170U
 #define MENU_X          ((uint16_t)((VIEW_W - MENU_W) / 2U))
-/* 居中于波形区（y 22~211）：22 + (190-150)/2 = 42 */
-#define MENU_Y          42U
+/* 居中于波形区（y 22~211）：22 + (190-170)/2 = 32 */
+#define MENU_Y          32U
 #define MENU_PAD        6U
 #define MENU_ROW_H      20U
 #define MENU_TITLE_Y    ((uint16_t)(MENU_Y + 4U))
@@ -37,17 +41,21 @@
 /* 行文字基线：第一行顶部 = MENU_Y + 24 */
 #define MENU_ROW_Y(i)   ((uint16_t)(MENU_Y + 24U + ((i) * MENU_ROW_H)))
 
-/* "500mV" / "5.00V" */
-static void Menu_FormatVdiv(uint16_t mv, char *buf, size_t n)
+/* 紧凑 V/div："500m" / "1.0V" / "10V"（一行里并排显示两路值，省宽度） */
+static void Menu_FormatVdivShort(uint16_t mv, char *buf, size_t n)
 {
-    if (mv >= 1000U)
+    if (mv >= 10000U)
     {
-        (void)snprintf(buf, n, "%u.%02uV", (unsigned)(mv / 1000U),
-                       (unsigned)((mv % 1000U) / 10U));
+        (void)snprintf(buf, n, "%uV", (unsigned)(mv / 1000U));
+    }
+    else if (mv >= 1000U)
+    {
+        (void)snprintf(buf, n, "%u.%uV", (unsigned)(mv / 1000U),
+                       (unsigned)((mv % 1000U) / 100U));
     }
     else
     {
-        (void)snprintf(buf, n, "%umV", (unsigned)mv);
+        (void)snprintf(buf, n, "%um", (unsigned)mv);
     }
 }
 
@@ -128,9 +136,17 @@ void ScopeMenu_Draw(const ScopeMenu_Info *info)
         switch (i)
         {
             case SCOPE_MENU_ROW_VDIV:
-                (void)snprintf(text, sizeof(text), "V/div");
-                Menu_FormatVdiv(info->vdiv_mv, value, sizeof(value));
+            {
+                char v1[8];
+                char v2[8];
+
+                (void)snprintf(text, sizeof(text), "V/div C%u",
+                               (unsigned)info->measure_ch);
+                Menu_FormatVdivShort(info->vdiv_mv1, v1, sizeof(v1));
+                Menu_FormatVdivShort(info->vdiv_mv2, v2, sizeof(v2));
+                (void)snprintf(value, sizeof(value), "%s/%s", v1, v2);
                 break;
+            }
 
             case SCOPE_MENU_ROW_TIM:
                 (void)snprintf(text, sizeof(text), "Time/div");
@@ -151,6 +167,11 @@ void ScopeMenu_Draw(const ScopeMenu_Info *info)
             case SCOPE_MENU_ROW_TRIG_LEVEL:
                 (void)snprintf(text, sizeof(text), "Trig level");
                 Menu_FormatLevel(info->trig_level_mv, value, sizeof(value));
+                break;
+
+            case SCOPE_MENU_ROW_AUTO:
+                (void)snprintf(text, sizeof(text), "Auto set");
+                (void)snprintf(value, sizeof(value), "KEY4");
                 break;
 
             case SCOPE_MENU_ROW_CAL:

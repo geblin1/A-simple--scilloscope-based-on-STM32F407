@@ -10,7 +10,7 @@
   *
   * 三个横条
   * --------
-  *   y   0 ~  21  状态栏  22 px  通道、V/div、Time/div、耦合、运行状态
+  *   y   0 ~  21  状态栏  22 px  通道、两路 V/div、Time/div、量程字母、运行状态
   *   y  22 ~ 211  波形区 190 px  8 x 10 网格，每格 40 x 19 px
   *   y 212 ~ 239  参数栏  28 px  频率、周期、Vpp、RMS、直流分量
   *
@@ -82,13 +82,15 @@ extern "C" {
 typedef struct
 {
     uint8_t  channel;       /* 当前选中通道：1 / 2 */
-    uint16_t vdiv_mv;       /* 当前通道 V/div，单位 mV（100~10000） */
+    uint16_t vdiv_mv1;      /* CH1 的 V/div，单位 mV（100~10000） */
+    uint16_t vdiv_mv2;      /* CH2 的 V/div（两路可以不同） */
     uint32_t tdiv_us;       /* Time/div，单位 us */
     uint32_t sample_rate;   /* 实际采样率，单位 Sa/s */
-    uint8_t  ac_dc;         /* 0 = DC，1 = AC */
-    uint8_t  range;         /* 前端量程：0 = 大量程(W)，1 = 小量程(S) */
+    uint8_t  range1;        /* CH1 前端量程：0 = 大量程(W)，1 = 小量程(S) */
+    uint8_t  range2;        /* CH2 前端量程：0 = 大量程(W)，1 = 小量程(S) */
     uint8_t  running;       /* 1 = RUN，0 = HOLD */
     uint8_t  rate_limited;  /* 1 = 采样率被硬件上限钳位，显示 LIMIT */
+    uint8_t  fft;           /* 1 = 频谱显示：V/div 位置显示 FFT，Time 位置改频率/格 */
 } StatusBar_Info;
 
 /**
@@ -119,6 +121,7 @@ typedef struct
     uint16_t        count;  /* 每通道样本数，最多 320 */
     uint16_t        vdiv_mv1;
     uint16_t        vdiv_mv2;
+    uint16_t        vdiv_mv_trig; /* 触发电平线的 y 用触发通道的 V/div 映射 */
     uint8_t         show1;
     uint8_t         show2;
     int32_t         trig_mv;    /* 触发电平（mV）；trig_state = 0 时不画 */

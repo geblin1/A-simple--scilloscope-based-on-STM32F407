@@ -4,18 +4,20 @@
   *
   * 界面按键约定（MAIN 模式）
   * ------------------------
-  *   KEY1 切换当前通道（参数栏测量 + 触发源，标定目标也跟着走）
+  *   KEY1 切换当前通道（参数栏测量 + 触发源 + 编码器1 的 V/div + 标定目标）
   *   KEY2 进入设置菜单
-  *   KEY3 切换显示通道（全显示 / 只看 CH1 / 只看 CH2）
+  *   KEY3 切换显示模式（双路 / 仅 CH1 / 仅 CH2 / FFT 频谱）
   *   KEY4 运行 / 停止
-  *   编码器1  调 V/div（CH1 与 CH2 一起缩放）
+  *   编码器1  调当前通道的 V/div（两路各自独立）
   *   编码器2  调 Time/div
   *
   * 菜单模式
   * --------
   *   编码器1 上下移动选中行，编码器2 改数值，KEY2 退出
   *
-  *   可选行：V/div、Time/div、触发源、触发边沿、触发电平、标定（Cal；KEY1 选通道、KEY4 启动）
+  *   可选行：V/div（当前通道，行内同时显示两路值）、Time/div、触发源、触发边沿、
+ *          触发电平、自动设置（Auto set；KEY4 执行）、标定（Cal；KEY4 启动）
+ *   KEY1 在菜单里任何一行都切换当前通道（编码器1 与 Cal 行都跟着走）。
  *
  * 触发（TRIGGER）
  * --------------
@@ -31,6 +33,17 @@
  *   单极性信号（PWM、逻辑电平）在默认 0 mV 下永远凑不出穿越条件，
  *   AUTO 让这类信号接上就能钉住；成功后电平会写回状态，菜单数值和
  *   屏幕上的电平线同步跟到实际触发位置。
+ *
+ * 频谱（FFT）
+ *
+ *   显示模式切到 FFT 时，对"当前通道"的 320 点显示窗取中间 256 点做 FFT
+ *   （Hann 窗、Q15 定点，见 Algorithm/Fft.c），把 0..采样率/2 的幅度谱
+ *   （相对最强谱线的 dB）画在波形区。状态栏 V/div 位置显示 "FFT"、
+ *   Time 位置改成"频率/格"（= 采样率/16）；参数栏仍是时域测量值，
+ *   键和编码器语义完全不变。
+ *   频谱被合成为一条 320 点"假波形"（y = 117 - mv/100，vdiv 固定 1900），
+ *   直接复用 WaveView 的增量刷新 / 行指纹 / 网格，不必另写一套绘制，
+ *   所以切到频谱也不会掉回整片重画那种低帧率。
  *
  * 运行模型（FreeRTOS）
   * -------------------
@@ -59,6 +72,7 @@
 
 #include "ADC_Drv.h"
 #include "EncoderDrv.h"
+#include "Fft.h"
 #include "Frontend.h"
 #include "Key.h"
 #include "Lcd.h"
@@ -93,17 +107,23 @@
 
 /* V/div 与前端量程的对应关系
    --------------------------
-   软件检测不到跳线乙，所以用 V/div 档位间接指定量程：
+   软件检测不到跳线乙，所以用 V/div 档位间接指定量程（两路各自独立）：
      前 4 档（100 / 200 / 500 / 1000 mV/div）-> 小量程，跳线乙插 MID
      后 3 档（2000 / 5000 / 10000 mV/div）   -> 大量程，跳线乙不插
-   状态栏右下角会显示 S / W，提示用户该把跳线放哪一档。
-   跨过这个分界时波形会突然变形，那是正常的——说明跳线位置和新档位对不上。 */
+   状态栏会分别显示两路各自的 S / W，提示用户该把对应通道的跳线放哪一档。
+   跨过这个分界时波形会突然变形，那是正常的——说明该通道的跳线位置和新档位对不上。 */
 #define APP_VDIV_SMALL_MAX  3U
 
-/* 显示通道组合 */
+/* 显示模式（KEY3 循环）：双路 / 仅 CH1 / 仅 CH2 / FFT 频谱 */
 #define APP_SHOW_BOTH       0U
 #define APP_SHOW_CH1        1U
 #define APP_SHOW_CH2        2U
+#define APP_SHOW_FFT        3U
+
+/* 频谱模式用来把 dB 映射成像素的"假 V/div"。
+   WaveView 的换算 y = 117 - mv*19/vdiv，取 1900 时正好是 y = 117 - mv/100，
+   App_BuildSpectrum() 按这个关系反推 mV 即可；不参与任何用户可见档位。 */
+#define APP_FFT_VDIV        1900U
 
 static const uint16_t k_vdiv_mv[APP_VDIV_COUNT] =
 {
@@ -121,7 +141,7 @@ typedef struct
 {
     uint8_t  measure_ch;    /* 参数栏测哪个通道：1 / 2 */
     uint8_t  show_mode;     /* APP_SHOW_xxx */
-    uint8_t  vdiv_idx;      /* 双通道共用同一个垂直档位 */
+    uint8_t  vdiv_idx[2];   /* [0]=CH1、[1]=CH2 各自独立的垂直档位 */
     uint8_t  tdiv_idx;
     uint8_t  running;
     uint8_t  rate_limited;
@@ -161,6 +181,10 @@ static SemaphoreHandle_t s_lock;             /* 保护 s_frame / s_have_frame */
 static SemaphoreHandle_t s_bus_lock;         /* 屏刷(SPI) 与 ADC 采集互斥 */
 static uint8_t         s_have_frame;         /* 至少发布过一帧（互斥量保护） */
 static uint8_t         s_draw_pending;       /* 有一帧欠着没画（界面任务私有） */
+static uint8_t         s_auto_pass;          /* AUTO 还要在新帧上再算几遍（界面私有） */
+static Fft_Result      s_fft;                /* 界面私有：最近一次频谱结果 */
+static uint32_t        s_fft_seq;            /* s_fft 对应的帧序号（0 = 还没算过） */
+static int32_t         s_spec[APP_CAP_LEN];  /* 频谱合成为 320 点"假波形"的 mV 刻度 */
 
 /* ---- 前端标定（菜单 Cal 行 -> KEY4 启动；两点法，逐通道逐量程） ---- */
 #define APP_CAL_IDLE        0U   /* 不在标定模式 */
@@ -227,9 +251,28 @@ static uint8_t App_BusLockWait(uint32_t timeout_ms)
 /* 前端量程（由 V/div 档位决定，见 k_vdiv_mv 上方说明）                */
 /* ------------------------------------------------------------------ */
 
-static void App_ApplyRange(void)
+/* 某一通道当前的 V/div（mV/格）。channel 用 FRONTEND_CH1 / FRONTEND_CH2 */
+static uint16_t App_VdivMv(uint8_t channel)
 {
-    Frontend_SetRange((s_st.vdiv_idx <= APP_VDIV_SMALL_MAX)
+    uint8_t idx = (channel == FRONTEND_CH2) ? 1U : 0U;
+
+    return k_vdiv_mv[s_st.vdiv_idx[idx]];
+}
+
+/* 触发相关的一切（迟滞、±5 格限制、电平步进）都跟触发通道的 V/div 走 */
+static uint16_t App_TrigVdivMv(void)
+{
+    return App_VdivMv(s_st.trig_src);
+}
+
+static void App_ApplyRanges(void)
+{
+    Frontend_SetRange(FRONTEND_CH1,
+                      (s_st.vdiv_idx[0] <= APP_VDIV_SMALL_MAX)
+                          ? FRONTEND_RANGE_SMALL
+                          : FRONTEND_RANGE_WIDE);
+    Frontend_SetRange(FRONTEND_CH2,
+                      (s_st.vdiv_idx[1] <= APP_VDIV_SMALL_MAX)
                           ? FRONTEND_RANGE_SMALL
                           : FRONTEND_RANGE_WIDE);
 }
@@ -282,7 +325,7 @@ static void App_Timebase(void)
    至少 1 mV，否则整型除法会把小档位压成 0，退化成单阈值比较。 */
 static void App_TriggerConfig(Trigger_Config *cfg)
 {
-    int32_t hyst = (int32_t)k_vdiv_mv[s_st.vdiv_idx] / 20;
+    int32_t hyst = (int32_t)App_TrigVdivMv() / 20;
 
     if (hyst < 1)
     {
@@ -300,7 +343,7 @@ static void App_TriggerConfig(Trigger_Config *cfg)
    只会让标记停在边框上，没有意义。 */
 static void App_ClampLevel(void)
 {
-    int32_t lim = (int32_t)k_vdiv_mv[s_st.vdiv_idx] * 5;
+    int32_t lim = (int32_t)App_TrigVdivMv() * 5;
 
     if (s_st.trig_level_mv > lim)
     {
@@ -552,13 +595,15 @@ static void App_DrawBars(void)
     (void)memset(&sb, 0, sizeof(sb));
 
     sb.channel      = s_st.measure_ch;
-    sb.vdiv_mv      = k_vdiv_mv[s_st.vdiv_idx];
+    sb.vdiv_mv1     = App_VdivMv(FRONTEND_CH1);
+    sb.vdiv_mv2     = App_VdivMv(FRONTEND_CH2);
     sb.tdiv_us      = s_st.tdiv_us;
     sb.sample_rate  = s_st.sps;
-    sb.ac_dc        = 0U;      /* 耦合由硬件跳线决定，这里固定显示 DC */
-    sb.range        = (uint8_t)Frontend_GetRange();
+    sb.range1       = (uint8_t)Frontend_GetRange(FRONTEND_CH1);
+    sb.range2       = (uint8_t)Frontend_GetRange(FRONTEND_CH2);
     sb.running      = s_st.running;
     sb.rate_limited = s_st.rate_limited;
+    sb.fft          = (s_st.show_mode == APP_SHOW_FFT) ? 1U : 0U;
 
     /* 状态栏内容在多数帧里不变，整条重画要 14 KB，值得跳过 */
     if ((s_sb_valid == 0U) || (memcmp(&s_sb_prev, &sb, sizeof(sb)) != 0))
@@ -596,6 +641,25 @@ static void App_DrawBars(void)
     ParamBar_Draw(&pb);
 }
 
+/* 把 dB 谱线合成为一条 320 点"假波形"：
+   dB(0..-60) -> y(22..211) -> mV（按 APP_FFT_VDIV 的换算反推）。
+   复用 WaveView 的好处：网格、脏行、行指纹、触发电平线的隐藏
+   全部沿用现成逻辑，频谱也能保持增量刷新的帧率。 */
+static void App_BuildSpectrum(const Fft_Result *fft)
+{
+    uint16_t x;
+
+    for (x = 0U; x < APP_CAP_LEN; x++)
+    {
+        uint16_t bin = (uint16_t)(((uint32_t)x * (uint32_t)fft->bins) / APP_CAP_LEN);
+        int32_t  db  = (int32_t)fft->mag_db[bin];
+        int32_t  h   = ((db + 60) * (int32_t)(VIEW_WAVE_H - 1U)) / 60;   /* 0..189 */
+        int32_t  y   = (int32_t)(VIEW_WAVE_Y + VIEW_WAVE_H - 1U) - h;    /* 22..211 */
+
+        s_spec[x] = ((int32_t)VIEW_WAVE_MID_Y - y) * 100;   /* y = 117 - mv/100 */
+    }
+}
+
 static void App_DrawWave(void)
 {
     WaveView_Data wd;
@@ -606,13 +670,42 @@ static void App_DrawWave(void)
         return;
     }
 
+    /* FFT 频谱：把谱线合成为一条"假波形"交给同一个 WaveView。
+       只在出现新帧时重算 —— HOLD 时频谱随画面一起冻结。 */
+    if (s_st.show_mode == APP_SHOW_FFT)
+    {
+        const int32_t *src   = (s_st.measure_ch == 2U) ? s_view.mv2 : s_view.mv1;
+        uint8_t        is_ch1 = (s_st.measure_ch == 1U) ? 1U : 0U;
+
+        if (s_view.seq != s_fft_seq)
+        {
+            Fft_Analyze(src, APP_CAP_LEN, &s_fft);
+            s_fft_seq = s_view.seq;
+        }
+        App_BuildSpectrum(&s_fft);
+
+        wd.ch1        = (is_ch1 != 0U) ? s_spec : 0;
+        wd.ch2        = (is_ch1 != 0U) ? 0 : s_spec;
+        wd.count      = APP_CAP_LEN;
+        wd.vdiv_mv1   = APP_FFT_VDIV;
+        wd.vdiv_mv2   = APP_FFT_VDIV;
+        wd.vdiv_mv_trig = APP_FFT_VDIV;    /* 频谱里不画电平线，给个有效值防除零 */
+        wd.show1      = is_ch1;
+        wd.show2      = (uint8_t)((is_ch1 != 0U) ? 0U : 1U);
+        wd.trig_mv    = 0;
+        wd.trig_state = APP_TRIG_STATE_OFF;   /* 频谱模式下不画触发电平线 */
+        WaveView_DrawTrace(&wd);
+        return;
+    }
+
     /* 网格/背景由 View_DrawFrame() 或 WaveView_Invalidate() 负责整片重画；
        这里只让 WaveView 增量刷新曲线经过的脏行。 */
     wd.ch1       = s_view.mv1;
     wd.ch2       = s_view.mv2;
     wd.count     = APP_CAP_LEN;
-    wd.vdiv_mv1  = k_vdiv_mv[s_st.vdiv_idx];
-    wd.vdiv_mv2  = k_vdiv_mv[s_st.vdiv_idx];
+    wd.vdiv_mv1  = App_VdivMv(FRONTEND_CH1);
+    wd.vdiv_mv2  = App_VdivMv(FRONTEND_CH2);
+    wd.vdiv_mv_trig = App_TrigVdivMv();   /* 电平线按触发通道的档位换算 */
     wd.show1     = (s_st.show_mode != APP_SHOW_CH2) ? 1U : 0U;
     wd.show2     = (s_st.show_mode != APP_SHOW_CH1) ? 1U : 0U;
     wd.trig_mv   = s_st.trig_level_mv;
@@ -629,7 +722,8 @@ static void App_DrawMenu(void)
     ScopeMenu_Info mi;
 
     mi.sel          = s_st.menu_sel;
-    mi.vdiv_mv      = k_vdiv_mv[s_st.vdiv_idx];
+    mi.vdiv_mv1     = App_VdivMv(FRONTEND_CH1);
+    mi.vdiv_mv2     = App_VdivMv(FRONTEND_CH2);
     mi.tdiv_us      = k_tdiv_us[s_st.tdiv_idx];
     mi.trig_src     = s_st.trig_src;
     mi.trig_edge    = (Trigger_Edge)s_st.trig_edge;
@@ -657,6 +751,150 @@ static uint8_t App_ClampStep(uint8_t idx, int16_t delta, uint8_t count)
     return (uint8_t)v;
 }
 
+/* ------------------------------------------------------------------ */
+/* 自动设置（AUTO）：按一帧数据自动选 V/div 与 Time/div                 */
+/* ------------------------------------------------------------------ */
+
+/* 取一段 mV 数据的最小/最大值（只看当前显示窗口的 320 点） */
+static void App_FrameRange(const int32_t *mv, int32_t *lo_out, int32_t *hi_out)
+{
+    int32_t  lo = mv[0];
+    int32_t  hi = mv[0];
+    uint16_t i;
+
+    for (i = 1U; i < APP_CAP_LEN; i++)
+    {
+        if (mv[i] < lo)
+        {
+            lo = mv[i];
+        }
+        if (mv[i] > hi)
+        {
+            hi = mv[i];
+        }
+    }
+
+    *lo_out = lo;
+    *hi_out = hi;
+}
+
+/* 单路选档：在"放得下"的前提下选最灵敏的一档。
+   放得下 = 峰峰值不超过 6 格（上下各留 2 格余量）
+            且绝对峰值不超过 4.5 格（带直流偏置的信号不会顶出屏幕）。
+   Vpp 与峰值都是前端换算出的真实输入 mV，与当前档位无关，
+   所以只要数据本身没被量程削顶，一帧就能定档。 */
+static uint8_t App_AutoPickVdiv(const int32_t *mv)
+{
+    int32_t lo = 0;
+    int32_t hi = 0;
+    uint8_t i;
+
+    App_FrameRange(mv, &lo, &hi);
+
+    for (i = 0U; i < APP_VDIV_COUNT; i++)
+    {
+        int32_t vdiv = (int32_t)k_vdiv_mv[i];
+        int32_t vpp  = hi - lo;
+        int32_t peak = (hi > -lo) ? hi : -lo;
+
+        if ((vpp <= (6 * vdiv)) && ((peak * 2) <= (9 * vdiv)))
+        {
+            return i;
+        }
+    }
+
+    return (uint8_t)(APP_VDIV_COUNT - 1U);   /* 都放不下时用最粗档 */
+}
+
+/* 两路各自选档：双路模式两路都算，单路模式只算显示的那一路，
+   FFT 只算当前通道（频谱源就是它）。 */
+static void App_AutoVdiv(const int32_t *mv1, const int32_t *mv2)
+{
+    uint8_t changed = 0U;
+    uint8_t ch;
+
+    for (ch = 0U; ch < 2U; ch++)
+    {
+        uint8_t idx;
+
+        if ((s_st.show_mode == APP_SHOW_CH1) && (ch == 1U))
+        {
+            continue;
+        }
+        if ((s_st.show_mode == APP_SHOW_CH2) && (ch == 0U))
+        {
+            continue;
+        }
+        if ((s_st.show_mode == APP_SHOW_FFT) && (ch != (uint8_t)(s_st.measure_ch - 1U)))
+        {
+            continue;
+        }
+
+        idx = App_AutoPickVdiv((ch == 0U) ? mv1 : mv2);
+        if (idx != s_st.vdiv_idx[ch])
+        {
+            s_st.vdiv_idx[ch] = idx;
+            changed = 1U;
+        }
+    }
+
+    if (changed != 0U)
+    {
+        App_ApplyRanges();   /* 跨过 1 V / 2 V 分界时同时切前端 S/W 量程 */
+        App_ClampLevel();    /* ±5 格的电平范围随触发通道档位变化 */
+    }
+}
+
+/* Time/div：屏幕上至少放 2 个完整周期，取满足条件里最快的档位。
+   1-2-5 步进决定了结果落在 2~5 个周期之间（再粗一档就不到 2 个周期）。
+   周期测不到（直流 / 幅度小于 60 mV）时保持当前时基不动。 */
+static void App_AutoTdiv(const Measure_Result meas[2])
+{
+    int32_t period_us;
+    uint8_t i;
+
+    /* 参数栏正在测的那一路优先；测不到就看另一路 */
+    period_us = meas[s_st.measure_ch - 1U].period_us;
+    if (period_us <= 0)
+    {
+        period_us = meas[(s_st.measure_ch == 1U) ? 1U : 0U].period_us;
+    }
+    if (period_us <= 0)
+    {
+        return;
+    }
+
+    for (i = 0U; i < APP_TDIV_COUNT; i++)
+    {
+        /* 屏幕 8 格 = 8*Time/div；至少 2 个周期：8*tdiv >= 2*period */
+        if (((int64_t)8 * (int64_t)k_tdiv_us[i]) >= ((int64_t)2 * (int64_t)period_us))
+        {
+            break;
+        }
+    }
+    if (i >= APP_TDIV_COUNT)            /* 最慢档也放不下 2 个周期 */
+    {
+        i = (uint8_t)(APP_TDIV_COUNT - 1U);
+    }
+
+    if (i != s_st.tdiv_idx)
+    {
+        s_st.tdiv_idx = i;
+        App_Timebase();
+    }
+}
+
+/* 自动设置一次：只改 V/div 与 Time/div，触发源/边沿/电平都不动
+   （电平的 AUTO 在采集路径里：找不到触发点时自动取信号中点）。
+   菜单里按 KEY4 时用当前屏幕帧先算一遍；随后界面任务每拉到一帧新数据
+   再算几遍（s_auto_pass），这样量程/时基已经换过之后的数据也能参与决策。 */
+static void App_AutoSetup(const int32_t *mv1, const int32_t *mv2,
+                          const Measure_Result meas[2])
+{
+    App_AutoVdiv(mv1, mv2);
+    App_AutoTdiv(meas);
+}
+
 /* 返回 1 表示需要重画 */
 static uint8_t App_HandleMain(int16_t d1, int16_t d2, uint8_t key)
 {
@@ -666,6 +904,7 @@ static uint8_t App_HandleMain(int16_t d1, int16_t d2, uint8_t key)
     {
         s_st.measure_ch = (s_st.measure_ch == 1U) ? 2U : 1U;
         s_st.trig_src   = s_st.measure_ch;   /* 选中的通道同时成为触发源 */
+        App_ClampLevel();                    /* 触发通道换了，±5 格范围可能变 */
         redraw          = 1U;
     }
     else if (key == 2U)
@@ -674,9 +913,9 @@ static uint8_t App_HandleMain(int16_t d1, int16_t d2, uint8_t key)
         s_st.menu_sel = 0U;
         redraw        = 1U;
     }
-    else if (key == 3U)
+    else if (key == 3U)                 /* KEY3：显示模式循环（含 FFT） */
     {
-        s_st.show_mode = (uint8_t)((s_st.show_mode + 1U) % 3U);
+        s_st.show_mode = (uint8_t)((s_st.show_mode + 1U) % 4U);
         redraw         = 1U;
     }
     else if (key == 4U)
@@ -685,12 +924,14 @@ static uint8_t App_HandleMain(int16_t d1, int16_t d2, uint8_t key)
         redraw       = 1U;
     }
 
-    /* 编码器1：垂直档位。双通道共用同一个 V/div，
-       这样两条波形用的是同一套电压-像素换算，不会出现"同屏却不同分辨率"。 */
+    /* 编码器1：当前通道的垂直档位（两路各自独立，KEY1 决定调哪一路） */
     if (d1 != 0)
     {
-        s_st.vdiv_idx = App_ClampStep(s_st.vdiv_idx, d1, APP_VDIV_COUNT);
-        App_ApplyRange();
+        uint8_t ch = (uint8_t)(s_st.measure_ch - 1U);
+
+        s_st.vdiv_idx[ch] = App_ClampStep(s_st.vdiv_idx[ch], d1, APP_VDIV_COUNT);
+        App_ApplyRanges();
+        App_ClampLevel();   /* 触发通道的 ±5 格范围可能跟着变 */
         redraw = 1U;
     }
     if (d2 != 0)
@@ -715,17 +956,17 @@ static void App_CalDraw(void)
     if (s_cal_step == APP_CAL_GND)
     {
         (void)snprintf(line, sizeof(line), "CAL CH%u/%s GND KEY4  K1:CH K2:ESC",
-                       (unsigned)s_cal_ch, Frontend_RangeLetter());
+                       (unsigned)s_cal_ch, Frontend_RangeLetter(s_cal_ch));
     }
     else if (s_cal_step == APP_CAL_SPAN)
     {
         (void)snprintf(line, sizeof(line), "CAL CH%u/%s 3V3 KEY4  K1:CH K2:ESC",
-                       (unsigned)s_cal_ch, Frontend_RangeLetter());
+                       (unsigned)s_cal_ch, Frontend_RangeLetter(s_cal_ch));
     }
     else
     {
         (void)snprintf(line, sizeof(line), "CAL CH%u/%s",
-                       (unsigned)s_cal_ch, Frontend_RangeLetter());
+                       (unsigned)s_cal_ch, Frontend_RangeLetter(s_cal_ch));
     }
 
     /* 和采集任务共用总线锁：不能一边 DMA 采样一边刷 LCD（见问题 28）。
@@ -784,6 +1025,7 @@ static void App_CalStart(void)
     s_st.running     = 0U;          /* 单次转换和 DMA 不能同时占用 ADC */
     s_cal_ch         = s_st.measure_ch;
     s_st.trig_src    = s_cal_ch;    /* 标定哪个通道，哪个通道就是触发源 */
+    App_ClampLevel();               /* 触发通道换了，±5 格范围可能变 */
     s_cal_step       = APP_CAL_GND;
     App_CalDraw();
 }
@@ -798,6 +1040,7 @@ static void App_CalHandle(uint8_t key)
         s_cal_ch = (s_cal_ch == FRONTEND_CH1) ? FRONTEND_CH2 : FRONTEND_CH1;
         s_st.measure_ch = s_cal_ch; /* 参数栏也跟着切到正在标定的通道 */
         s_st.trig_src   = s_cal_ch; /* 触发源跟着走，标定完就看这一路 */
+        App_ClampLevel();           /* 触发通道换了，±5 格范围可能变 */
         s_cal_step = APP_CAL_GND;
         App_CalDraw();
         return;
@@ -846,7 +1089,7 @@ static void App_CalHandle(uint8_t key)
         }
 
         (void)printf("CAL CH%u/%s zero=%u span=%u diff=%ld\r\n",
-                     (unsigned)s_cal_ch, Frontend_RangeLetter(),
+                     (unsigned)s_cal_ch, Frontend_RangeLetter(s_cal_ch),
                      (unsigned)s_cal_zero_raw, (unsigned)raw, (long)span);
 
         WaveView_DrawMessage("CAL SAVING...");
@@ -872,6 +1115,13 @@ static uint8_t App_HandleMenu(int16_t d1, int16_t d2, uint8_t key)
 {
     uint8_t redraw = 0U;
 
+    /* 用户自己动了按键/编码器：取消 AUTO 还没跑完的后续遍数，
+       免得过两帧又把他刚调好的档位改掉。Auto 行按 KEY4 会重新置位。 */
+    if ((d1 != 0) || (d2 != 0) || (key != 0U))
+    {
+        s_auto_pass = 0U;
+    }
+
     if (key == 2U)
     {
         s_st.menu = 0U;
@@ -879,18 +1129,35 @@ static uint8_t App_HandleMenu(int16_t d1, int16_t d2, uint8_t key)
         return 1U;
     }
 
-    /* 标定行：KEY1 切换要标定的通道，KEY4 启动两点标定 */
+    /* KEY1：任何一行都切换“当前通道”（参数栏测量 + 触发源 + V/div/Cal 目标） */
+    if (key == 1U)
+    {
+        s_st.measure_ch = (s_st.measure_ch == 1U) ? 2U : 1U;
+        s_st.trig_src   = s_st.measure_ch;   /* 当前通道同时是触发源 */
+        App_ClampLevel();                    /* 触发通道换了，±5 格范围可能变 */
+        redraw          = 1U;
+    }
+
+    /* 标定行：KEY4 启动两点标定（标定哪一路由上面的 KEY1 决定） */
     if (s_st.menu_sel == SCOPE_MENU_ROW_CAL)
     {
-        if (key == 1U)
-        {
-            s_st.measure_ch = (s_st.measure_ch == 1U) ? 2U : 1U;
-            s_st.trig_src   = s_st.measure_ch;   /* 当前通道同时是触发源 */
-            redraw          = 1U;
-        }
-        else if (key == 4U)
+        if (key == 4U)
         {
             App_CalStart();
+            return 1U;
+        }
+    }
+
+    /* 自动设置行：KEY4 用当前屏幕帧做一遍 AUTO，并安排后续新帧再判几遍 */
+    if (s_st.menu_sel == SCOPE_MENU_ROW_AUTO)
+    {
+        if (key == 4U)
+        {
+            if (s_view.seq != 0U)
+            {
+                App_AutoSetup(s_view.mv1, s_view.mv2, s_view.meas);
+                s_auto_pass = 2U;
+            }
             return 1U;
         }
     }
@@ -912,9 +1179,15 @@ static uint8_t App_HandleMenu(int16_t d1, int16_t d2, uint8_t key)
         switch (s_st.menu_sel)
         {
             case SCOPE_MENU_ROW_VDIV:
-                s_st.vdiv_idx = App_ClampStep(s_st.vdiv_idx, d2, APP_VDIV_COUNT);
-                App_ApplyRange();
+            {
+                uint8_t ch = (uint8_t)(s_st.measure_ch - 1U);
+
+                s_st.vdiv_idx[ch] = App_ClampStep(s_st.vdiv_idx[ch], d2,
+                                                  APP_VDIV_COUNT);
+                App_ApplyRanges();
+                App_ClampLevel();
                 break;
+            }
 
             case SCOPE_MENU_ROW_TIM:
                 s_st.tdiv_idx = App_ClampStep(s_st.tdiv_idx, d2, APP_TDIV_COUNT);
@@ -923,6 +1196,7 @@ static uint8_t App_HandleMenu(int16_t d1, int16_t d2, uint8_t key)
 
             case SCOPE_MENU_ROW_TRIG_SRC:
                 s_st.trig_src = (s_st.trig_src == 1U) ? 2U : 1U;
+                App_ClampLevel();   /* 触发通道换了，±5 格范围可能变 */
                 break;
 
             case SCOPE_MENU_ROW_TRIG_EDGE:
@@ -930,9 +1204,9 @@ static uint8_t App_HandleMenu(int16_t d1, int16_t d2, uint8_t key)
                 break;
 
             case SCOPE_MENU_ROW_TRIG_LEVEL:
-                /* 步进 = 1/10 格：和 V/div 一起变，屏幕上看起来移动速度一致 */
+                /* 步进 = 触发通道的 1/10 格 */
                 s_st.trig_level_mv += (int32_t)d2 *
-                                      ((int32_t)k_vdiv_mv[s_st.vdiv_idx] / 10);
+                                      ((int32_t)App_TrigVdivMv() / 10);
                 App_ClampLevel();
                 break;
 
@@ -953,7 +1227,8 @@ void App_Scope_Init(void)
 {
     s_st.measure_ch   = 1U;
     s_st.show_mode    = APP_SHOW_BOTH;
-    s_st.vdiv_idx     = 2U;      /* 500 mV/div（双通道共用） */
+    s_st.vdiv_idx[0]  = 2U;      /* CH1：500 mV/div */
+    s_st.vdiv_idx[1]  = 2U;      /* CH2：500 mV/div */
     s_st.tdiv_idx     = 5U;      /* 1.00 ms/div -> 40 kSa/s */
     s_st.running      = 0U;      /* 上电先停在 HOLD，等用户按 KEY4 再开始测量 */
     s_st.rate_limited = 0U;
@@ -979,8 +1254,9 @@ void App_Scope_Init(void)
     Lcd_Backlight(1U);
 
     EncoderDrv_Reset();
+
     App_Timebase();
-    App_ApplyRange();
+    App_ApplyRanges();
 
     View_DrawFrame();
 
@@ -1095,6 +1371,19 @@ uint8_t App_Scope_UiStep(void)
         if (s_cal_step != APP_CAL_IDLE)
         {
             return 1U;
+        }
+
+        /* AUTO 的后续几遍：等界面任务拉到新帧再算。第一遍用的是按 KEY4
+           之前的帧，可能是在错误量程/时基下测的（比如小量程削顶的信号），
+           换过档位后的新帧再判一次才能收敛。没有新帧就下一轮再看。 */
+        if ((s_st.menu != 0U) && (s_auto_pass != 0U))
+        {
+            if (App_PullFrame() != 0U)
+            {
+                s_auto_pass--;
+                App_AutoSetup(s_view.mv1, s_view.mv2, s_view.meas);
+                redraw = 1U;
+            }
         }
 
         if (s_st.menu != 0U)

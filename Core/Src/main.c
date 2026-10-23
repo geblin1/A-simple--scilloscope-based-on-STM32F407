@@ -1,11 +1,3 @@
-/*
- * @Author: geblin1 3390931275@qq.com
- * @Date: 2026-10-12 20:10:44
- * @LastEditors: geblin1 3390931275@qq.com
- * @LastEditTime: 2026-10-20 22:20:00
- * @FilePath: \基于STM32F407ZGT6的简易示波器\Core\Src\main.c
- * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
- */
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
